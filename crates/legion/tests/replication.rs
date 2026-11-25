@@ -185,6 +185,19 @@ impl Lab {
     }
 
     fn dump_pg(&self) {
+        self.daemon_logs(&["replication", "prepare", "diverged"], 40);
+        for v in &self.vms {
+            let out = self.ssh(
+                v,
+                "ps -axww -o pid,jid,etime,command | grep -E 'postgres|legion-replication' | grep -v grep",
+            );
+            eprintln!(
+                "=== processes on {}
+{}",
+                v.name,
+                text(&out.stdout)
+            );
+        }
         eprintln!("replication: {}", self.repl());
         eprintln!(
             "{}",

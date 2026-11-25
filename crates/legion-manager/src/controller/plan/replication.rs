@@ -601,9 +601,11 @@ pub(super) fn reads(n: &Node) -> bool {
 }
 
 /// What a new task of ordinal `slot` of a replicated Service is told at
-/// first: its role as recorded (ordinal 0 before any primary is named;
-/// none while one is being replaced), the epoch, and no topology yet,
-/// which the pass gives it, so a replica waits at `prepare`.
+/// first: a replica, with no topology, so it waits at `prepare` until the
+/// pass tells it more; only ordinal 0 of a Service with no primary named
+/// yet starts as primary. A new task of the primary's ordinal is named
+/// primary by a pass, never at its making: made in the pass that starts a
+/// failover, it would escape the fence, as of the status before.
 pub(super) fn initial(s: &Service, slot: Option<u32>) -> Option<TaskReplication> {
     let r = s.spec.replication.as_ref()?;
     let svc = &s.object.metadata.name;
@@ -612,10 +614,10 @@ pub(super) fn initial(s: &Service, slot: Option<u32>) -> Option<TaskReplication>
         .status
         .get("replication")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let _ = svc;
     let named = match &st {
         None => Some(0),
-        Some(st) if st.change.as_ref().is_some_and(|c| c.to.is_none()) => None,
-        Some(st) => st.primary.as_deref().and_then(|p| ordinal(svc, p)),
+        Some(_) => None,
     };
     Some(TaskReplication {
         config: Replication {

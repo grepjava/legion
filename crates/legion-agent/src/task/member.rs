@@ -192,7 +192,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                             Ok(Err(e)) => Err(Abort::Failed(format!("waiting for the replication prepare: {e}"))),
                             Err(_) => Ok(Said::Failed("failed".into(), "prepare did not finish in time".into())),
                         },
-                        abort = self.stopped() => Err(abort),
+                        // Told another role meanwhile: what it prepares for
+                        // is no longer wanted.
+                        why = self.retold(told.role) => match why {
+                            Some(abort) => Err(abort),
+                            None => Ok(Said::Failed(spi::RETRY.into(), "told another role".into())),
+                        },
                     }
                 }
             };
@@ -237,6 +242,28 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         "replication prepare: {code}: {message}{how}"
                     )));
                 }
+            }
+        }
+    }
+
+    /// Until the task is stopped (`Some`), or told a role other than
+    /// `role` (`None`); other news is taken as it comes.
+    async fn retold(&mut self, role: Role) -> Option<Abort> {
+        if self.stopping {
+            return Some(Abort::Stopped);
+        }
+        loop {
+            match self.rx.recv().await {
+                Some(super::Msg::Stop) => return Some(Abort::Stopped),
+                Some(super::Msg::Pause(p)) => self.paused = p,
+                Some(super::Msg::Replication(r)) => {
+                    self.a.spec.replication = r.map(|r| *r);
+                    if self.told().is_some_and(|r| r.role != role) {
+                        return None;
+                    }
+                }
+                Some(_) => {}
+                None => return Some(Abort::Closing),
             }
         }
     }
