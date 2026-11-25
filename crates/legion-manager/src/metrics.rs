@@ -103,6 +103,67 @@ impl ManagerMetrics {
     }
 }
 
+/// Replicated databases, as the leader last recorded them (positions and
+/// lag at most every 30 s): each replica's lag behind the primary, and
+/// each database's phase.
+fn replication(services: &[&Object], m: &mut Metrics) {
+    use legion_api::replication::{Phase, ReplicationStatus, spi::Role};
+    let read: Vec<(&Object, ReplicationStatus)> = services
+        .iter()
+        .filter_map(|o| {
+            let st = serde_json::from_value(o.status.get("replication")?.clone()).ok()?;
+            Some((*o, st))
+        })
+        .collect();
+    let mut f = m.gauge(
+        "legion_replication_lag_bytes",
+        "Bytes of the primary's log a database replica lacks, as it last said.",
+    );
+    for (o, st) in &read {
+        for (member, ms) in &st.members {
+            if ms.status.role != Role::Replica {
+                continue;
+            }
+            let behind = ms.status.lag.as_ref().and_then(|l| l.bytes).or_else(|| {
+                let (p, q) = (st.primary_position?, ms.status.position?);
+                q.behind(&p)
+            });
+            if let Some(b) = behind {
+                f.sample(
+                    &[
+                        ("namespace", &o.metadata.namespace),
+                        ("service", &o.metadata.name),
+                        ("member", member),
+                    ],
+                    b as f64,
+                );
+            }
+        }
+    }
+    let mut f = m.gauge(
+        "legion_replication_phase",
+        "1 for a replicated database's phase (forming, healthy, degraded, failing-over, split).",
+    );
+    for (o, st) in &read {
+        for phase in [
+            Phase::Forming,
+            Phase::Healthy,
+            Phase::Degraded,
+            Phase::FailingOver,
+            Phase::Split,
+        ] {
+            f.sample(
+                &[
+                    ("namespace", &o.metadata.namespace),
+                    ("service", &o.metadata.name),
+                    ("phase", phase.as_str()),
+                ],
+                f64::from(u8::from(st.phase == phase)),
+            );
+        }
+    }
+}
+
 /// What each node's agent last reported of its ZFS pool and of each ZFS
 /// Volume on it (with its heartbeats, within the last minute), and the
 /// size each Volume asks for. The agents report to the leader; a follower
@@ -346,6 +407,8 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         f.sample(&[("namespace", ns), ("service", name)], f64::from(n));
     }
 
+    replication(&services.iter().map(|(o, _)| *o).collect::<Vec<_>>(), m);
+
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     let mut f = m.gauge("legion_node_ready", "1 if the node is ready, else 0.");
     for o in of(Kind::Node) {
@@ -425,5 +488,33 @@ mod tests {
         ] {
             assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn a_replicated_database_has_its_lag_and_phase() {
+        let mut o = Object::new(Kind::Service, "data", "pg", serde_json::json!({}));
+        o.status = serde_json::json!({ "replication": {
+            "epoch": 2, "primary": "pg-0", "phase": "degraded",
+            "primaryPosition": { "term": 1, "offset": "9000" },
+            "members": {
+                "pg-0": { "task": "pg-0-1", "at": 1, "role": "primary", "healthy": true },
+                "pg-1": { "task": "pg-1-1", "at": 1, "role": "replica", "healthy": true,
+                    "position": { "term": 1, "offset": "8000" } },
+                "pg-2": { "task": "pg-2-1", "at": 1, "role": "replica", "healthy": true,
+                    "lag": { "bytes": "64" } }
+            }
+        }});
+        let mut m = Metrics::default();
+        replication(&[&o], &mut m);
+        let text = m.finish();
+        for line in [
+            r#"legion_replication_lag_bytes{namespace="data",service="pg",member="pg-1"} 1000"#,
+            r#"legion_replication_lag_bytes{namespace="data",service="pg",member="pg-2"} 64"#,
+            r#"legion_replication_phase{namespace="data",service="pg",phase="degraded"} 1"#,
+            r#"legion_replication_phase{namespace="data",service="pg",phase="healthy"} 0"#,
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
+        }
+        assert!(!text.contains(r#"member="pg-0""#), "no lag for the primary");
     }
 }

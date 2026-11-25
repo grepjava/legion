@@ -65,6 +65,9 @@ pub enum AlertKind {
     PoolNearlyFull,
     ScrubOverdue,
     VersionSkew,
+    DatabaseDegraded,
+    DatabaseSplit,
+    DatabaseStalled,
 }
 
 impl AlertKind {
@@ -86,6 +89,9 @@ impl AlertKind {
             AlertKind::PoolNearlyFull => "pool-nearly-full",
             AlertKind::ScrubOverdue => "scrub-overdue",
             AlertKind::VersionSkew => "version-skew",
+            AlertKind::DatabaseDegraded => "database-degraded",
+            AlertKind::DatabaseSplit => "database-split",
+            AlertKind::DatabaseStalled => "database-stalled",
         }
     }
 }
@@ -170,6 +176,22 @@ pub struct StaleReplica {
     pub why: String,
 }
 
+/// A replicated database (a Service's `status.replication`) as alerts
+/// look at it.
+pub struct DatabaseInput<'a> {
+    pub namespace: &'a str,
+    /// The Service.
+    pub name: &'a str,
+    pub phase: crate::replication::Phase,
+    pub message: &'a str,
+    /// How long a change of primary has been under way, if one is.
+    pub change_for: Option<Duration>,
+}
+
+/// A change of primary under way longer than this raises
+/// `database-stalled`: one that goes well takes seconds to a minute.
+pub const DATABASE_STALLED: Duration = Duration::from_secs(180);
+
 /// A node's pool as alerts look at it.
 pub struct PoolInput<'a> {
     pub node: &'a str,
@@ -199,6 +221,8 @@ pub struct Inputs<'a> {
     pub pools: Vec<PoolInput<'a>>,
     /// Each node's build (`NodeStatus::version`), of the nodes not down.
     pub versions: Vec<(&'a str, &'a str)>,
+    /// The replicated databases.
+    pub databases: Vec<DatabaseInput<'a>>,
     /// Now, in milliseconds since the epoch.
     pub now_ms: i64,
 }
@@ -469,6 +493,40 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
             }
         }
     }
+    for d in &i.databases {
+        use crate::replication::Phase;
+        let alert = |kind, severity, message| Alert {
+            kind,
+            severity,
+            namespace: d.namespace.to_owned(),
+            object: format!("Service/{}", d.name),
+            message,
+        };
+        match (d.phase, d.change_for) {
+            (Phase::Split, _) => out.push(alert(
+                AlertKind::DatabaseSplit,
+                Severity::Critical,
+                format!("Service {}'s database is split: {}", d.name, d.message),
+            )),
+            (Phase::FailingOver, Some(f)) if f >= DATABASE_STALLED => out.push(alert(
+                AlertKind::DatabaseStalled,
+                Severity::Critical,
+                format!(
+                    "Service {}'s change of primary has been under way for {}, with no primary \
+                     taking writes meanwhile: {}",
+                    d.name,
+                    crate::clock::span(f),
+                    d.message
+                ),
+            )),
+            (Phase::Degraded, _) => out.push(alert(
+                AlertKind::DatabaseDegraded,
+                Severity::Warning,
+                format!("Service {}'s database is degraded: {}", d.name, d.message),
+            )),
+            _ => {}
+        }
+    }
     // Builds told apart by their version: those of the nodes up, unless
     // one says none (an agent from before it did).
     let mut builds: Vec<&str> = i
@@ -658,7 +716,7 @@ impl ReceiverSpec {
 }
 
 /// The kinds of alert there are, as receivers name them.
-pub const KINDS: [AlertKind; 16] = [
+pub const KINDS: [AlertKind; 19] = [
     AlertKind::NoLeader,
     AlertKind::NoQuorum,
     AlertKind::NodeDown,
@@ -675,6 +733,9 @@ pub const KINDS: [AlertKind; 16] = [
     AlertKind::PoolNearlyFull,
     AlertKind::ScrubOverdue,
     AlertKind::VersionSkew,
+    AlertKind::DatabaseDegraded,
+    AlertKind::DatabaseSplit,
+    AlertKind::DatabaseStalled,
 ];
 
 fn http_url(url: &str) -> bool {
@@ -1103,7 +1164,7 @@ namespaces: ['']",
         // A kind added to AlertKind but not to KINDS couldn't be chosen.
         let named: std::collections::BTreeSet<_> = KINDS.iter().map(|k| k.as_str()).collect();
         assert_eq!(named.len(), KINDS.len());
-        let last = AlertKind::VersionSkew;
+        let last = AlertKind::DatabaseStalled;
         assert!(KINDS.contains(&last));
     }
 
@@ -1179,6 +1240,48 @@ namespaces: ['']",
         assert_eq!(
             got[1].message,
             "Volume logs has not been backed up to offsite yet, meant to be every 1h: offsite: Permission denied (attempt 1; the next in 5s)"
+        );
+    }
+
+    #[test]
+    fn a_replicated_database_raises_degraded_split_and_stalled() {
+        use crate::replication::Phase;
+        let db = |name, phase, change_for| DatabaseInput {
+            namespace: "data",
+            name,
+            phase,
+            message: "why",
+            change_for,
+        };
+        let i = Inputs {
+            leader: true,
+            databases: vec![
+                db("a", Phase::Healthy, None),
+                db("b", Phase::Degraded, None),
+                db("c", Phase::Split, None),
+                db("d", Phase::FailingOver, Some(Duration::from_secs(30))),
+                db("e", Phase::FailingOver, Some(Duration::from_secs(300))),
+                db("f", Phase::Forming, None),
+            ],
+            ..Default::default()
+        };
+        let got = alerts(&i);
+        let kinds: Vec<(AlertKind, Severity, &str)> = got
+            .iter()
+            .map(|a| (a.kind, a.severity, a.object.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (AlertKind::DatabaseSplit, Severity::Critical, "Service/c"),
+                (AlertKind::DatabaseStalled, Severity::Critical, "Service/e"),
+                (AlertKind::DatabaseDegraded, Severity::Warning, "Service/b"),
+            ]
+        );
+        assert_eq!(
+            got[1].message,
+            "Service e's change of primary has been under way for 5m, with no primary taking \
+             writes meanwhile: why"
         );
     }
 

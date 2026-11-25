@@ -156,10 +156,11 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             .map(|l| l.objects)
             .unwrap_or_default()
     };
-    let (nodes, tasks, volumes) = (
+    let (nodes, tasks, volumes, services) = (
         objects(Kind::Node),
         objects(Kind::Task),
         objects(Kind::Volume),
+        objects(Kind::Service),
     );
     // Each node's spec and status as read; a node down says nothing of
     // its pools or build that is current.
@@ -240,6 +241,26 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             stale_replica: stale_replica(v, now_ms),
             late_snapshots: late_snapshots(v, now_ms),
             late_backup: late_backup(v, now_ms),
+        });
+    }
+    // Replicated databases, as the leader last recorded them.
+    let databases: Vec<(&Object, legion_api::replication::ReplicationStatus)> = services
+        .iter()
+        .filter_map(|o| {
+            let st = serde_json::from_value(o.status.get("replication")?.clone()).ok()?;
+            Some((o, st))
+        })
+        .collect();
+    for (o, st) in &databases {
+        inputs.databases.push(alert::DatabaseInput {
+            namespace: &o.metadata.namespace,
+            name: &o.metadata.name,
+            phase: st.phase,
+            message: &st.message,
+            change_for: st
+                .change
+                .as_ref()
+                .map(|c| Duration::from_millis(now_ms.saturating_sub(c.started).max(0) as u64)),
         });
     }
     if let Some(c) = &api.peer_tls
