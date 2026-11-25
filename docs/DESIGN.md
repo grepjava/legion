@@ -1850,8 +1850,10 @@ How it was built, where it differs from the outline below:
   primary is a replica and stops like one. Without such a replica it is
   stopped as before. A rolling update takes the primary's slot last.
   Eviction by a `NoExecute` taint stays immediate.
-- **Not built yet**: the console tab; `legion replication check`; WAL
-  archiving.
+- **The console** has the Replication tab, alerts and metrics described
+  below; the stalled alert is a change of primary under way over 3
+  minutes, as a failed failover keeps waiting rather than giving up.
+- **Not built yet**: `legion replication check`; WAL archiving.
 
 **The spec.** The fields go on a stateful Service:
 
@@ -1971,8 +1973,10 @@ is never simply stopped:
 
 **Console.** The Service gets a Replication tab: the members, roles,
 positions, lag and phase, with switchover and failover behind the usual
-review. Alerts fire on `degraded`, `split` and failed failovers, and
-`legion_replication_lag_bytes` is exported.
+review. Alerts fire on `degraded` (`database-degraded`), `split`
+(`database-split`) and failed failovers (`database-stalled`), and
+`legion_replication_lag_bytes` and `legion_replication_phase` are
+exported.
 
 **Risks and limits.**
 

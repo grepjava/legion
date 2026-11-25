@@ -15,6 +15,7 @@
   import ServiceTasks from '#lib/ServiceTasks.svelte';
   import NodeHost from '#lib/NodeHost.svelte';
   import Rollout from '#lib/Rollout.svelte';
+  import ServiceReplication from '#lib/ServiceReplication.svelte';
   import ServicePorts from '#lib/ServicePorts.svelte';
   import Taints from '#lib/Taints.svelte';
   import TaskLogs from '#lib/TaskLogs.svelte';
@@ -40,6 +41,7 @@
   let tab:
     | 'details'
     | 'rollout'
+    | 'replication'
     | 'tasks'
     | 'usage'
     | 'quota'
@@ -87,6 +89,11 @@
     );
   });
 
+  // A Service that replicates a database, or did, has a page for it.
+  const databased = $derived.by(() => {
+    const o = object as LObject | null;
+    return !!(o?.spec?.replication || o?.status?.replication);
+  });
   // A Volume that keeps a replica, or kept one, has a page for it.
   const replicated = $derived.by(() => {
     const o = object as LObject | null;
@@ -95,6 +102,7 @@
   const tabs = $derived([
     { id: 'details', label: t('Details') },
     ...(kind === 'Service' ? [{ id: 'rollout', label: t('Rollout') }] : []),
+    ...(kind === 'Service' && databased ? [{ id: 'replication', label: t('Replication') }] : []),
     ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: t('Logs') }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: t('Tasks') }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: t('Data') }] : []),
@@ -367,6 +375,8 @@
     {/if}
   {:else if tab === 'rollout'}
     <Rollout service={object} />
+  {:else if tab === 'replication'}
+    <ServiceReplication service={object} />
   {:else if tab === 'data'}
     <VolumeData volume={object} />
   {:else if tab === 'replica'}

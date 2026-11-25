@@ -261,6 +261,7 @@ export function tone(state: string): string {
     case 'running':
     case 'complete':
     case 'active':
+    case 'healthy':
       return 'good';
     case 'pending':
     case 'starting':
@@ -270,12 +271,16 @@ export function tone(state: string): string {
     case 'draining':
     case 'paused':
     case 'stale':
+    case 'forming':
+    case 'degraded':
+    case 'failing-over':
       return 'wait';
     case 'failed':
     case 'failing':
     case 'rejected':
     case 'down':
     case 'orphaned':
+    case 'split':
       return 'bad';
     default:
       return '';

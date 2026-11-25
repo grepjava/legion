@@ -34,6 +34,14 @@ members are told their role only on nodes that read it.
   none during a change), and with `read: true`, `<service>-read` to the
   healthy replicas.
 - **`legion replication status|switchover|failover`.**
+- **The console's Replication tab** on a replicated Service: the named
+  primary and epoch, the phase and why, each member's role, position, lag
+  and when it was last heard from, a change under way and the last one,
+  and a switchover or failover asked for through the usual review.
+- **Alerts and metrics**: `database-degraded` (warning), `database-split`
+  and `database-stalled` (critical: a change of primary under way for over
+  3 minutes); `legion_replication_lag_bytes` per replica and
+  `legion_replication_phase`.
 - **A primary is handed over, not stopped**: a drain of its node (or its
   data moving), a rolling update (which now replaces the replicas first and
   the primary last) and a scale-down past it switch over to a healthy
