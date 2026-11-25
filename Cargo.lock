@@ -1906,6 +1906,7 @@ dependencies = [
  "hyper-util",
  "legion-api",
  "legion-pki",
+ "libc",
  "prost",
  "protox",
  "serde_json",

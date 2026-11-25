@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
 legion-api.workspace = true
+libc.workspace = true
 legion-pki.workspace = true
 prost.workspace = true
 serde_json.workspace = true

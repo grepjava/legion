@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use legion_pki::SERVER_NAME;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::client::danger::{
@@ -332,6 +332,16 @@ impl Credentials {
     pub fn channel(&self, endpoint: Endpoint) -> Channel {
         endpoint.connect_with_connector_lazy(Connector {
             config: self.client.clone(),
+            stack: None,
+        })
+    }
+
+    /// [`Self::channel`], its connections on the TCP stack `stack` (FreeBSD's
+    /// `tcp_rack`, say) where the kernel has it loaded, else the default.
+    pub fn channel_on(&self, endpoint: Endpoint, stack: &'static str) -> Channel {
+        endpoint.connect_with_connector_lazy(Connector {
+            config: self.client.clone(),
+            stack: Some(stack),
         })
     }
 
@@ -397,6 +407,71 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 struct Connector {
     config: Arc<ClientConfig>,
+    /// The TCP stack asked for, where loaded.
+    stack: Option<&'static str>,
+}
+
+/// Puts `socket` on the TCP stack `name` (FreeBSD's `TCP_FUNCTION_BLK`);
+/// whether it could. Elsewhere, or with the stack's module not loaded, it
+/// stays on the default.
+fn use_stack(socket: &TcpSocket, name: &str) -> bool {
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut set: libc::tcp_function_set = unsafe { std::mem::zeroed() };
+        let bytes = name.as_bytes();
+        if bytes.len() >= set.function_set_name.len() {
+            return false;
+        }
+        for (d, s) in set.function_set_name.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        let r = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FUNCTION_BLK,
+                (&raw const set).cast(),
+                std::mem::size_of::<libc::tcp_function_set>() as libc::socklen_t,
+            )
+        };
+        r == 0
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = (socket, name);
+        false
+    }
+}
+
+/// Said once: the stack asked for is not there.
+static NO_STACK: std::sync::Once = std::sync::Once::new();
+
+/// A connection to `host:port`, on `stack` where it can be.
+async fn connect_tcp(host: &str, port: u16, stack: Option<&str>) -> std::io::Result<TcpStream> {
+    let Some(stack) = stack else {
+        return TcpStream::connect((host, port)).await;
+    };
+    let mut last = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        if !use_stack(&socket, stack) {
+            NO_STACK.call_once(|| {
+                tracing::info!(
+                    "TCP stack {stack} not loaded (kldload tcp_{stack}): managers' connections use the default one"
+                )
+            });
+        }
+        match socket.connect(addr).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other(format!("{host}: no address"))))
 }
 
 impl tower_service::Service<Uri> for Connector {
@@ -410,6 +485,7 @@ impl tower_service::Service<Uri> for Connector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let config = self.config.clone();
+        let stack = self.stack;
         Box::pin(async move {
             let host = uri.host().ok_or("no host to connect to")?;
             let host = host
@@ -418,7 +494,7 @@ impl tower_service::Service<Uri> for Connector {
                 .to_owned();
             let port = uri.port_u16().ok_or("no port to connect to")?;
             let connect = async {
-                let tcp = TcpStream::connect((host.as_str(), port)).await?;
+                let tcp = connect_tcp(&host, port, stack).await?;
                 tcp.set_nodelay(true)?;
                 let name = ServerName::try_from(SERVER_NAME)?.to_owned();
                 let tls = TlsConnector::from(config).connect(name, tcp).await?;
@@ -436,6 +512,23 @@ mod tests {
     use legion_pki::{Ca, Identity, Role};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_connection_asks_for_a_tcp_stack_and_does_without_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A stack the kernel lacks: the default one, connected all the same.
+        let none = TcpSocket::new_v4().unwrap();
+        assert!(!use_stack(&none, "nosuchstack"));
+        connect_tcp("127.0.0.1", port, Some("nosuchstack"))
+            .await
+            .expect("connected on the default stack");
+        // FreeBSD's own is always there: the option reaches the kernel.
+        #[cfg(target_os = "freebsd")]
+        assert!(use_stack(&TcpSocket::new_v4().unwrap(), "freebsd"));
+        // Too long a name is never sent.
+        assert!(!use_stack(&TcpSocket::new_v4().unwrap(), &"x".repeat(40)));
+    }
 
     #[test]
     fn renewal_takes_a_matching_pair_only() {

@@ -168,7 +168,10 @@ pub(crate) fn connect_lazy(addr: &str, tls: Option<&Arc<Credentials>>) -> Channe
     let endpoint = Endpoint::from_shared(format!("http://{addr}"))
         .unwrap_or_else(|_| Endpoint::from_static("http://invalid.invalid:1"));
     match tls {
-        Some(tls) => tls.channel(endpoint),
+        // RACK where loaded: across a lossy link far off, the default
+        // stack waits a retransmission timeout for a call's lost last
+        // segment (no tail loss probe), longer than the call may take.
+        Some(tls) => tls.channel_on(endpoint, "rack"),
         None => endpoint.connect_lazy(),
     }
 }
