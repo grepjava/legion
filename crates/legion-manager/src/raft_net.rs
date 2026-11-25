@@ -350,9 +350,12 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         mut rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcErr<openraft::error::Infallible>> {
-        // From the start: encoding a large batch takes its share too.
+        // From the start: encoding a large batch takes its share too. Near
+        // all of openraft's time: on a link far off, a call whose last
+        // segment is lost waits a retransmission timeout (FreeBSD's default
+        // stack sends no tail loss probe), 0.86 s in all on the witness's.
         let start = tokio::time::Instant::now();
-        let allowed = option.hard_ttl().mul_f64(0.8);
+        let allowed = option.hard_ttl().mul_f64(0.95);
         let link = *self.budgets.lock().unwrap().entry(self.target).or_default();
         let budget = link.budget;
         let entries = rpc.entries.len();
