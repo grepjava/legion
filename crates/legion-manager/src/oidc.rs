@@ -365,8 +365,13 @@ fn identity(oidc: &Oidc, claims: &Value) -> Result<(String, Vec<String>), String
         .as_str()
         .filter(|n| !n.is_empty())
         .ok_or_else(|| format!("the ID token has no {} claim", oidc.username_claim))?;
-    if oidc.username_claim == "email" && claims["email_verified"] == Value::Bool(false) {
-        return Err(format!("the provider has not verified {name}"));
+    // Only an email the provider says it verified: one it says nothing of
+    // (some never do) could be anyone's, and name another's account (found
+    // by an audit). Such a provider takes another claim (`sub`).
+    if oidc.username_claim == "email" && claims["email_verified"] != Value::Bool(true) {
+        return Err(format!(
+            "the provider has not said it verified {name} (email_verified); name the user by another claim"
+        ));
     }
     let groups = match &claims[&oidc.groups_claim] {
         Value::String(g) => vec![g.clone()],
@@ -429,7 +434,7 @@ mod tests {
     fn claims() -> Value {
         serde_json::json!({
             "iss": "https://idp.example", "aud": "legion", "exp": 2000,
-            "nonce": "n1", "email": "alice@example.com",
+            "nonce": "n1", "email": "alice@example.com", "email_verified": true,
             "groups": ["shop", "ops"],
         })
     }
@@ -514,7 +519,20 @@ mod tests {
         // An email the provider has not verified is no name.
         let mut c = claims();
         c["email_verified"] = false.into();
-        assert!(identity(&o, &c).unwrap_err().contains("not verified"));
+        assert!(
+            identity(&o, &c)
+                .unwrap_err()
+                .contains("not said it verified")
+        );
+        // Nor one it says nothing of.
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("email_verified");
+        assert!(
+            identity(&o, &c)
+                .unwrap_err()
+                .contains("not said it verified")
+        );
+        assert!(identity(&o, &claims()).is_ok());
         let mut c = claims();
         c.as_object_mut().unwrap().remove("email");
         assert!(identity(&o, &c).unwrap_err().contains("no email claim"));

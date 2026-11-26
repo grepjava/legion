@@ -254,18 +254,20 @@ pub(crate) async fn support_bundle(
 }
 
 /// Words in a field's name that say its value may be a secret.
-const SECRET_WORDS: [&str; 6] = [
+const SECRET_WORDS: [&str; 7] = [
     "password",
     "token",
     "secret",
     "auth",
     "credential",
     "private",
+    "key",
 ];
 
 /// `v` with what could be secret replaced: every environment variable's
-/// value, a Config's data, a field whose name says secret, and the login in
-/// a URL (`https://user:token@host`).
+/// value, a Config's data or text (what it holds is a string: found by an
+/// audit, it went out whole, the audit trail's included), a field whose
+/// name says secret, and the login in a URL (`https://user:token@host`).
 fn masked(mut v: Value) -> Value {
     fn walk(v: &mut Value, key: &str) {
         match v {
@@ -273,7 +275,7 @@ fn masked(mut v: Value) -> Value {
                 for (k, child) in map.iter_mut() {
                     let lower = k.to_ascii_lowercase();
                     if key == "env" && k == "value"
-                        || (k == "data" && child.is_object())
+                        || ((k == "data" || k == "text") && !child.is_null())
                         || SECRET_WORDS.iter().any(|w| lower.contains(w))
                     {
                         *child = Value::String("<masked>".to_owned());
@@ -331,6 +333,16 @@ mod tests {
         assert_eq!(c["args"][1], "postgres://<masked>@db:5432/app");
         assert_eq!(m["git"], "https://github.com/me/app");
         assert_eq!(c["image"], "nginx");
+        // A Config as stored: its data and text are strings.
+        let config = masked(json!({
+            "kind": "Config",
+            "spec": { "data": "c2VjcmV0", "text": "[{\"user\":\"alice\"}]" },
+            "signingKey": "k",
+        }));
+        assert_eq!(config["spec"]["data"], "<masked>");
+        assert_eq!(config["spec"]["text"], "<masked>");
+        assert_eq!(config["signingKey"], "<masked>");
+        assert_eq!(config["kind"], "Config");
     }
 
     #[test]

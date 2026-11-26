@@ -363,6 +363,21 @@ members are told their role only on nodes that read it.
   is now; it is left out (found by an audit). A move onto the node
   receiving a replica's copy waits for that copy to end (the agent refuses
   a second receive into the dataset) rather than destroy what it took.
+- From the same audit, smaller fixes: a support bundle masks a Config's
+  data and text (strings, so they went out whole, the audit trail's
+  included) and any field whose name says key; with `usernameClaim:
+  email`, a sign-in needs the provider to say it verified the email
+  (`email_verified: true`), as one saying nothing of it could name
+  another's account; a Raft call that failed at once no longer counts as
+  a round trip of a millisecond for the link's budget; leadership is
+  handed over one request at a time; an agent's cleanup that panicked no
+  longer leaves its task uncleanable until the agent restarts; uploads
+  through `legion cp` and the console no longer hold one of the agent's
+  threads while the disk is slow; a listing's directory descriptor is
+  close-on-exec; a PostgreSQL replica whose copy was cut short is copied
+  again under `reclone: allow` rather than failing for good; a primary
+  takes changed settings (allowed clients, WAL kept, archiving) at once
+  on reload.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion
