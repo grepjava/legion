@@ -354,6 +354,10 @@ members are told their role only on nodes that read it.
   longer checks a build log's rights on its own replica before passing
   the call on as itself: the leader checks them, for the caller (found
   by an audit).
+- The pods' resolver gave every DNS query a task and a socket, with no
+  bound, so a pod flooding it could exhaust the node's agent; it answers
+  256 UDP queries and serves 64 TCP connections at once at most, dropping
+  queries past that (their clients ask again). Found by an audit.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

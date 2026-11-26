@@ -253,6 +253,14 @@ pub async fn serve_file(
     }
 }
 
+/// Queries over UDP being answered at once, at most: past them a query is
+/// dropped (its client asks again), so a pod flooding the resolver cannot
+/// make the node's agent hold a socket and a task for each (found by an
+/// audit: there was no bound).
+const MAX_UDP_QUERIES: usize = 256;
+/// TCP connections served at once, at most: past them one is closed.
+const MAX_TCP_CONNECTIONS: usize = 64;
+
 /// Serves DNS on `udp` and `tcp` until the zone's sender goes away.
 pub async fn serve(
     udp: UdpSocket,
@@ -260,6 +268,29 @@ pub async fn serve(
     zone: watch::Receiver<Arc<Zone>>,
     upstream: Vec<SocketAddr>,
 ) {
+    serve_within(
+        udp,
+        tcp,
+        zone,
+        upstream,
+        MAX_UDP_QUERIES,
+        MAX_TCP_CONNECTIONS,
+    )
+    .await;
+}
+
+/// [`serve`], with at most `udp_queries` answered and `tcp_connections`
+/// served at once.
+async fn serve_within(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    zone: watch::Receiver<Arc<Zone>>,
+    upstream: Vec<SocketAddr>,
+    udp_queries: usize,
+    tcp_connections: usize,
+) {
+    let udp_permits = Arc::new(tokio::sync::Semaphore::new(udp_queries));
+    let tcp_permits = Arc::new(tokio::sync::Semaphore::new(tcp_connections));
     let udp = Arc::new(udp);
     let upstream = Arc::new(upstream);
     let mut closed = zone.clone();
@@ -268,9 +299,13 @@ pub async fn serve(
         tokio::select! {
             r = udp.recv_from(&mut buf) => match r {
                 Ok((n, peer)) => {
+                    let Ok(permit) = udp_permits.clone().try_acquire_owned() else {
+                        continue;
+                    };
                     let query = buf[..n].to_vec();
                     let (udp, zone, upstream) = (udp.clone(), zone.clone(), upstream.clone());
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let zone = zone.borrow().clone();
                         if let Some(resp) = answer(&query, &zone, &upstream, false).await {
                             let _ = udp.send_to(&resp, peer).await;
@@ -281,8 +316,13 @@ pub async fn serve(
             },
             r = tcp.accept() => match r {
                 Ok((stream, _)) => {
+                    let Ok(permit) = tcp_permits.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let (zone, upstream) = (zone.clone(), upstream.clone());
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = serve_tcp(stream, zone, &upstream).await {
                             tracing::debug!("dns: tcp: {e}");
                         }
@@ -618,6 +658,55 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Found by an audit: each query got a task and a socket, unbounded.
+    /// Past the bound a query is dropped (its client asks again) and a TCP
+    /// connection closed; within it, answered.
+    #[tokio::test]
+    async fn queries_past_the_bound_are_dropped() {
+        let up = upstream().await;
+        let serving = |udp_queries, tcp_connections| {
+            let up = up;
+            async move {
+                let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addrs = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+                let (tx, rx) = watch::channel(Arc::new(zone()));
+                tokio::spawn(serve_within(
+                    udp,
+                    tcp,
+                    rx,
+                    vec![up],
+                    udp_queries,
+                    tcp_connections,
+                ));
+                (addrs, tx)
+            }
+        };
+        let asked = async |at: SocketAddr| {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client
+                .send_to(&query("web.shop.legion.", RecordType::A), at)
+                .await
+                .unwrap();
+            let mut buf = vec![0; 4096];
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .is_ok()
+        };
+        let ((udp, tcp), _keep) = serving(1, 1).await;
+        assert!(asked(udp).await, "within the bound");
+        let mut s = TcpStream::connect(tcp).await.unwrap();
+        write_framed(&mut s, &query("web.shop.legion.", RecordType::A))
+            .await
+            .unwrap();
+        assert!(read_framed(&mut s).await.is_ok());
+        let ((udp, tcp), _keep) = serving(0, 0).await;
+        assert!(!asked(udp).await, "past the bound: dropped");
+        let mut s = TcpStream::connect(tcp).await.unwrap();
+        let _ = write_framed(&mut s, &query("web.shop.legion.", RecordType::A)).await;
+        assert!(read_framed(&mut s).await.is_err(), "past the bound: closed");
     }
 
     /// The resolver as a process of its own serves its zone file, follows
