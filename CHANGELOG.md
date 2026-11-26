@@ -325,6 +325,11 @@ members are told their role only on nodes that read it.
   terminal stayed with it. Terminals opened at once for several sessions
   no longer share one buffer for their names (`ptsname`). Both found by
   an audit.
+- **Security:** inspecting a registry's image (`legion image inspect`,
+  the console's Images page) needed no rights: anyone with a certificate
+  had the manager reach any registry named and learned what a namespace's
+  ImagePolicy makes of the image. It now takes reading the namespace's
+  Services (`default` unless `-n`). Found by an audit.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

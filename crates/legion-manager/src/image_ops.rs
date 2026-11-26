@@ -595,6 +595,16 @@ pub(crate) async fn inspect_registry_image(
         ));
     }
     api.consistent().await?;
+    // The manager reaches the registry named, and says what the namespace's
+    // ImagePolicy makes of the image: as much as who may read its Services
+    // sees, not anyone with a certificate (found by an audit).
+    let ns = if req.namespace.is_empty() {
+        "default"
+    } else {
+        req.namespace.as_str()
+    };
+    check_namespace(ns)?;
+    caller.check(&api.store, Verb::Read, Kind::Service, ns)?;
     let auth = secret_auth(api, &caller, &req.namespace, &req.secret)?;
     let logins = if auth.is_empty() {
         Vec::new()

@@ -7506,3 +7506,46 @@ async fn a_vm_pod_needs_its_namespace_to_allow_it() {
         .unwrap();
     admin.clone().apply(guest).await.unwrap();
 }
+
+/// Found by an audit: inspecting a registry's image needed no rights, so
+/// anyone with a certificate had the manager reach any registry named and
+/// learned what a namespace's ImagePolicy makes of it. It takes reading the
+/// namespace's Services now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inspecting_a_registrys_image_takes_reading_the_namespace() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move { admin.apply(binding("shop", "alice", "view")).await }
+    })
+    .await;
+    let inspect = |name: &str, namespace: &str| {
+        let user = creds(&ca, name, Role::User);
+        let namespace = namespace.to_owned();
+        let m = &m;
+        async move {
+            ClusterClient::new(m.channel(Some(&user)).await.unwrap())
+                .inspect_registry_image(legion_proto::v1::InspectRegistryImageRequest {
+                    image: "registry.invalid:1/x/y:1".into(),
+                    namespace,
+                    secret: String::new(),
+                    node: String::new(),
+                })
+                .await
+        }
+    };
+    // Nobody's: refused before anything is reached.
+    denied(inspect("mallory", "shop").await);
+    denied(inspect("alice", "bank").await);
+    // Alice reads shop: let through (the registry, unreachable, is the
+    // only failure left).
+    let r = inspect("alice", "shop").await;
+    assert!(
+        r.as_ref()
+            .is_err_and(|e| e.code() != Code::PermissionDenied),
+        "{r:?}"
+    );
+}
