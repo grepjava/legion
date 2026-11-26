@@ -1,0 +1,25 @@
+[
+{ type: install
+  message: <<EOM
+To run Legion, as root:
+
+  sysrc -f /boot/loader.conf kern.racct.enable=1   # rctl limits; reboot once
+  zfs create -o mountpoint=/zroot/legion zroot/legion
+  sysrc legion_enable=YES legion_args="--zfs-root zroot/legion"
+  service legion start
+  legion init          # on the first manager; other nodes run legion join
+
+Legion needs pf enabled, with /etc/pf.conf calling its anchors.
+
+  legion doctor --fix pf
+
+shows the lines it would add, asks, checks the new file with pfctl -nf,
+keeps the old one as /etc/pf.conf.legion-<time>, then enables and loads pf.
+legion init and legion join offer it too. legion doctor checks the rest of
+what a host needs and changes nothing.
+
+The daemon logs to /var/log/legion.log. "service legion stop" leaves the
+pods running; the next start takes them over.
+EOM
+}
+]
