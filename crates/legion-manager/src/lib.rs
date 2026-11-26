@@ -496,6 +496,7 @@ impl Manager {
             store: self.store.clone(),
             speaking: self.speaking.clone(),
             refusals: Default::default(),
+            tls: self.credentials.is_some(),
         };
         let mut server =
             tonic::transport::Server::builder().layer(requests::Layer(self.requests.clone()));

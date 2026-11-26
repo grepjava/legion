@@ -340,6 +340,14 @@ members are told their role only on nodes that read it.
   Volumes made before keep working; to change one, or make another, the
   cluster admin allows the driver first. A stack's namespace allows the
   drivers its Volumes declare.
+- **Security:** the Raft service did not refuse a removed or demoted
+  manager's certificate, as the API does, nor check that a call's
+  certificate is the manager whose id it speaks for; `Cluster.Campaign`
+  took any manager's. Now a removed certificate is refused there too, a
+  certificate speaks only for its own manager, and only the leader a
+  manager follows may ask it to stand (found by an audit). Every manager
+  still holds the cluster CA's key, so a removed manager that kept it is
+  stopped for good only by rotating the CA (`legion ca rotate`).
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

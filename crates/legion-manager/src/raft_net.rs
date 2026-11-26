@@ -425,6 +425,8 @@ pub struct RaftService {
     /// are refused.
     pub(crate) speaking: Speaking,
     pub(crate) refusals: Refusals,
+    /// Calls come with a manager's certificate (mutual TLS).
+    pub(crate) tls: bool,
 }
 
 fn decode<T: DeserializeOwned>(req: Request<RaftPayload>) -> Result<T, Status> {
@@ -436,6 +438,35 @@ impl RaftService {
     /// Refuses calls from managers this one does not know: those of the
     /// cluster a restore left (DESIGN.md §3.7), which would otherwise vote
     /// it back into the old cluster.
+    /// The calling manager, by its certificate: refused if removed (or
+    /// demoted) since it was issued, as the API refuses it (found by an
+    /// audit: the Raft service did not ask).
+    fn caller(&self, req: &Request<RaftPayload>) -> Result<Option<String>, Status> {
+        let Some(id) = crate::tls::caller(req, self.tls)? else {
+            return Ok(None);
+        };
+        if let Some(issued) = crate::tls::caller_issued(req, self.tls)? {
+            crate::removed::check(&self.store, &id.name, issued)?;
+        }
+        Ok(Some(id.name))
+    }
+
+    /// Refuses a call whose certificate is one manager's and whose vote
+    /// speaks for another's id (found by an audit). An id with no name on
+    /// record yet passes: [`Self::known`] holds it to the membership.
+    fn speaks_for(&self, caller: Option<&str>, vote: &Vote<NodeId>) -> Result<(), Status> {
+        let (Some(caller), Some(from)) = (caller, vote.leader_id().voted_for()) else {
+            return Ok(());
+        };
+        let names = crate::managers::names(&self.store)?;
+        match names.get(&from) {
+            Some(named) if named != caller => Err(Status::permission_denied(format!(
+                "manager {caller}'s certificate does not speak for {named} ({from})"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn known(&self, vote: &Vote<NodeId>) -> Result<(), Status> {
         let from = vote.leader_id().voted_for();
         if self.store.knows(from) {
@@ -483,16 +514,20 @@ impl raft_server::Raft for RaftService {
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
         let peer = heard(req.metadata());
+        let caller = self.caller(&req)?;
         let rpc: AppendEntriesRequest<TypeConfig> = decode(req)?;
         self.known(&rpc.vote)?;
+        self.speaks_for(caller.as_deref(), &rpc.vote)?;
         self.compatible(peer, &rpc.vote)?;
         self.answer(self.store.raft.append_entries(rpc).await)
     }
 
     async fn vote(&self, req: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
         let peer = heard(req.metadata());
+        let caller = self.caller(&req)?;
         let rpc: VoteRequest<NodeId> = decode(req)?;
         self.known(&rpc.vote)?;
+        self.speaks_for(caller.as_deref(), &rpc.vote)?;
         self.compatible(peer, &rpc.vote)?;
         self.answer(self.store.raft.vote(rpc).await)
     }
@@ -502,13 +537,24 @@ impl raft_server::Raft for RaftService {
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
         let peer = heard(req.metadata());
+        let caller = self.caller(&req)?;
         let rpc: InstallSnapshotRequest<TypeConfig> = decode(req)?;
         self.known(&rpc.vote)?;
+        self.speaks_for(caller.as_deref(), &rpc.vote)?;
         self.compatible(peer, &rpc.vote)?;
         self.answer(self.store.raft.install_snapshot(rpc).await)
     }
 
-    async fn read_index(&self, _: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+    async fn read_index(&self, req: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+        // A manager of this cluster's, by name, not removed.
+        if let Some(caller) = self.caller(&req)?
+            && crate::managers::id_of(&self.store, &caller)?
+                .is_some_and(|id| !self.store.knows(Some(id)))
+        {
+            return Err(Status::permission_denied(format!(
+                "manager {caller} is not a member of this cluster"
+            )));
+        }
         // Handing leadership on: confirming would reach the followers.
         if self.store.hushed() {
             return encode(Err::<Option<u64>, String>(

@@ -5256,6 +5256,43 @@ async fn a_removed_manager_leaves_the_membership_and_is_refused() {
             .await,
     );
     assert!(why.contains("node m3 was removed"), "{why}");
+    // And by the Raft service (found by an audit: it did not ask).
+    let raft_as = |c: &ClientTlsConfig| {
+        let c = c.clone();
+        let first = &first;
+        async move {
+            legion_proto::v1::raft_client::RaftClient::new(first.channel(Some(&c)).await.unwrap())
+        }
+    };
+    let why = denied(
+        raft_as(&old_m3)
+            .await
+            .read_index(legion_proto::v1::RaftPayload::default())
+            .await,
+    );
+    assert!(why.contains("node m3 was removed"), "{why}");
+    // A manager's certificate speaks only for its own id: m2's, asking a
+    // vote as the first manager, is refused.
+    let first_id = status().await.node_id;
+    let vote = openraft::raft::VoteRequest::<u64>::new(openraft::Vote::new(9, first_id), None);
+    let why = denied(
+        raft_as(&creds(&ca, "m2", Role::Manager))
+            .await
+            .vote(legion_proto::v1::RaftPayload {
+                json: serde_json::to_vec(&vote).unwrap(),
+            })
+            .await,
+    );
+    assert!(why.contains("does not speak for"), "{why}");
+    // Only the leader asks a manager to stand.
+    let mut as_m2 = ClusterClient::new(
+        first
+            .channel(Some(&creds(&ca, "m2", Role::Manager)))
+            .await
+            .unwrap(),
+    );
+    let why = denied(as_m2.campaign(legion_proto::v1::CampaignRequest {}).await);
+    assert!(why.contains("only the leader"), "{why}");
     // The two left go on.
     eventually(|| {
         let mut objects = objects.clone();

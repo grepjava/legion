@@ -1744,9 +1744,26 @@ impl Cluster for ApiService {
         &self,
         req: Request<pb::CampaignRequest>,
     ) -> Result<Response<pb::CampaignResponse>, Status> {
-        // The leader handing leadership on, by its manager's certificate.
-        match crate::tls::caller(&req, self.peer_tls.is_some())? {
-            Some(id) if id.role == Role::Manager => {}
+        // The leader handing leadership on, by its manager's certificate:
+        // not one removed since, and the leader this manager follows
+        // (found by an audit: any manager's certificate did).
+        let tls = self.peer_tls.is_some();
+        match crate::tls::caller(&req, tls)? {
+            Some(id) if id.role == Role::Manager => {
+                if let Some(issued) = crate::tls::caller_issued(&req, tls)? {
+                    crate::removed::check(&self.store, &id.name, issued)?;
+                }
+                let leader = self.store.raft.metrics().borrow().current_leader;
+                let names = crate::managers::names(&self.store)?;
+                if let Some(leading) = leader.and_then(|l| names.get(&l))
+                    && *leading != id.name
+                {
+                    return Err(Status::permission_denied(format!(
+                        "only the leader asks another to stand: {leading} leads, not {}",
+                        id.name
+                    )));
+                }
+            }
             _ => {
                 return Err(Status::permission_denied(
                     "only a manager asks another to stand",
