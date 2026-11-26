@@ -404,7 +404,9 @@ mod terminal {
                 return Err(std::io::Error::last_os_error());
             }
             let saved = t;
+            // SAFETY: changes the termios it is given, which is ours.
             unsafe { libc::cfmakeraw(&mut t) };
+            // SAFETY: stdin, and a termios that lives across the call.
             if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -414,6 +416,7 @@ mod terminal {
 
     impl Drop for Raw {
         fn drop(&mut self) {
+            // SAFETY: stdin, and the termios saved on entering.
             unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
         }
     }

@@ -418,6 +418,7 @@ fn use_stack(socket: &TcpSocket, name: &str) -> bool {
     #[cfg(target_os = "freebsd")]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: tcp_function_set is plain data; zero is a valid one.
         let mut set: libc::tcp_function_set = unsafe { std::mem::zeroed() };
         let bytes = name.as_bytes();
         if bytes.len() >= set.function_set_name.len() {
@@ -426,6 +427,8 @@ fn use_stack(socket: &TcpSocket, name: &str) -> bool {
         for (d, s) in set.function_set_name.iter_mut().zip(bytes) {
             *d = *s as libc::c_char;
         }
+        // SAFETY: a valid socket, and a pointer to a filled-in set of the
+        // size given, read only during the call.
         let r = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),

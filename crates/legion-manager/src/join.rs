@@ -527,12 +527,19 @@ pub(crate) async fn promote_learners(
         tracing::info!(?ready, "promoting caught-up managers to voters");
         // Without a quorum (the manager promoted stopped meanwhile) the
         // change waits for one: not past shutdown, which waits for this.
+        // Bounded too, so a change stuck without a quorum is tried again
+        // later rather than hold the promotions behind it (found by an
+        // audit).
+        let changed = tokio::time::timeout(
+            crate::COMMIT_TIMEOUT,
+            raft.change_membership(ChangeMembers::AddVoterIds(ready), false),
+        );
         tokio::select! {
-            changed = raft.change_membership(ChangeMembers::AddVoterIds(ready), false) => {
-                if let Err(e) = changed {
-                    tracing::warn!("promoting managers: {e}");
-                }
-            }
+            changed = changed => match changed {
+                Ok(Err(e)) => tracing::warn!("promoting managers: {e}"),
+                Err(_) => tracing::warn!("promoting managers: no quorum in time; trying again"),
+                Ok(Ok(_)) => {}
+            },
             _ = closing.wait_for(|c| *c) => return,
         }
     }

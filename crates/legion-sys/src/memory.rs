@@ -276,6 +276,8 @@ pub(crate) mod freebsd {
 
     /// The packed records of a sysctl, each starting with its size.
     fn records<T: Copy>(buf: &[u8], mut each: impl FnMut(T, &[u8])) {
+        // Each record starts with its size, read as four bytes of a `T`.
+        const { assert!(std::mem::size_of::<T>() >= 4) };
         let mut at = 0;
         while at + std::mem::size_of::<T>() <= buf.len() {
             let size = c_int::from_ne_bytes(buf[at..at + 4].try_into().expect("four bytes"));

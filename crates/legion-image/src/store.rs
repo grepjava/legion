@@ -1664,15 +1664,21 @@ fn apply_layer(
     std::fs::create_dir_all(mnt)?;
     let mountpoint = mnt.to_string_lossy().into_owned();
     let props = [("mountpoint", mountpoint.as_str())];
-    match parent {
-        Some(p) => sys.zfs_clone(p, ds, &props)?,
-        None => sys.zfs_create(ds, &props)?,
+    let made = match parent {
+        Some(p) => sys.zfs_clone(p, ds, &props),
+        None => sys.zfs_create(ds, &props),
+    };
+    if let Err(e) = made {
+        let _ = std::fs::remove_dir(mnt);
+        return Err(e.into());
     }
     let applied = layer::apply(tar, mnt)
         .and_then(|()| Ok(sys.zfs_set(ds, "mountpoint", "none")?))
         .and_then(|()| Ok(sys.zfs_snapshot(&format!("{ds}@{SNAPSHOT}"))?));
     if let Err(e) = applied {
         let _ = sys.zfs_destroy(ds, true);
+        // Its mount point goes too, failed or not (found by an audit).
+        let _ = std::fs::remove_dir(mnt);
         return Err(e);
     }
     let _ = std::fs::remove_dir(mnt);
