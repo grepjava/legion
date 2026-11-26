@@ -1,0 +1,1 @@
+function e(e,t){if(!t||`closedBy`in HTMLDialogElement.prototype||e.target!==t)return;let n=t.getBoundingClientRect();n.top<=e.clientY&&e.clientY<=n.bottom&&n.left<=e.clientX&&e.clientX<=n.right||t.close()}export{e as t};
