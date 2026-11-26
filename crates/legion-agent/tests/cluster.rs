@@ -1151,6 +1151,16 @@ async fn a_volume_lost_with_its_node_is_restored_into() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_provides_an_nfs_volume_to_the_others() {
     let c = Cluster::start(3).await;
+    // The host mounts it: its namespace allows that.
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Namespace
+metadata: { name: shop }
+spec: { security: { allow: [nfsVolumes] } }
+"#,
+    )
+    .await;
     c.apply(
         r#"
 apiVersion: legion/v1
