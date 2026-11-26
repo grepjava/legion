@@ -41,9 +41,59 @@ pub(crate) struct Volumes {
     pub lock: Arc<Mutex<()>>,
     /// How this node exports the iSCSI LUNs it provides.
     pub iscsi: crate::exports::IscsiConfig,
+    /// The datasets a copy is being received into, by a session of this
+    /// agent's: until the receive ends, what it kept has no resume token
+    /// yet, and a new copy must not take its place.
+    pub receiving: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// A receive into a dataset, under way until dropped.
+pub(crate) struct Receiving {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ds: String,
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.ds);
+    }
+}
+
+/// [`RECEIVE_BUSY`], for `ds`.
+fn busy(ds: &str) -> Status {
+    Status::unavailable(format!(
+        "{RECEIVE_BUSY}: a copy is still being taken into {ds}"
+    ))
 }
 
 impl Volumes {
+    /// A receive into `ds` begun; refused while another is: its sender
+    /// gone (a leader restarted), it lets go of the dataset only once it
+    /// notices. Seen 2026-11-26: a new leader, finding no resume token
+    /// while the receive before still ran, sent the copy whole again, and
+    /// the receive destroyed the 21 GB kept of it.
+    pub(crate) fn receiving(&self, ds: &str) -> Result<Receiving, Status> {
+        let mut set = self.receiving.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(ds.to_owned()) {
+            return Err(busy(ds));
+        }
+        Ok(Receiving {
+            set: self.receiving.clone(),
+            ds: ds.to_owned(),
+        })
+    }
+
+    /// Whether a receive into `ds` is under way.
+    pub(crate) fn is_receiving(&self, ds: &str) -> bool {
+        self.receiving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(ds)
+    }
+
     pub(crate) fn dataset(&self, namespace: &str, volume: &str) -> Result<String, Status> {
         let root = self.zfs_root.as_deref().ok_or_else(|| {
             Status::failed_precondition("this node has no ZFS dataset for volumes")
@@ -89,6 +139,7 @@ pub(crate) async fn receive(
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
+    let _receiving = v.receiving(&ds)?;
     let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
     let lock = v.lock.clone();
     let work = crate::task::blocking(&v.sys, move |sys| {
@@ -372,6 +423,11 @@ pub(crate) async fn resume_token(
     tx: &mpsc::Sender<SessionFrame>,
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
+    // A receive under way has written no token yet: none is not "nothing
+    // kept" then, which would have the copy sent whole again.
+    if v.is_receiving(&ds) {
+        return Err(busy(&ds));
+    }
     let token = crate::task::blocking(&v.sys, move |sys| -> Result<Option<String>, String> {
         let here = sys
             .zfs_list(&ds)
@@ -431,6 +487,7 @@ pub(crate) async fn replica_receive(
         return Err(Status::invalid_argument("not a replica's snapshot"));
     }
     let ds = v.dataset(namespace, &opts.volume)?;
+    let _receiving = v.receiving(&ds)?;
     let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
     let lock = v.lock.clone();
     let work = crate::task::blocking(&v.sys, move |sys| {
@@ -1092,6 +1149,43 @@ mod tests {
         assert!(e.contains("a full copy is needed"), "{e}");
         assert!(replica_snapshot("legion-replica-12") && !replica_snapshot("legion-replica-x"));
         assert!(!replica_snapshot("mine"));
+    }
+
+    /// Seen 2026-11-26: a leader restarted while its copy was being taken
+    /// in; the new one, finding no resume token yet (the receive still
+    /// ran), sent it whole again, which destroyed the 21 GB kept. While a
+    /// receive is under way, a second is refused and so is the token,
+    /// both as busy, which the manager waits out.
+    #[tokio::test]
+    async fn a_receive_under_way_holds_off_another_and_the_token() {
+        let v = Volumes {
+            sys: Arc::new(FakeSys::new()),
+            zfs_root: Some("tank/legion".into()),
+            lock: Arc::new(Mutex::new(())),
+            iscsi: Default::default(),
+            receiving: Default::default(),
+        };
+        let ds = v.dataset("shop", "db").unwrap();
+        let first = v.receiving(&ds).unwrap();
+        assert!(v.is_receiving(&ds));
+        let e = v.receiving(&ds).err().unwrap();
+        assert!(legion_api::volume::receive_busy(e.message()), "{e:?}");
+        let (tx, _rx) = mpsc::channel(4);
+        let e = resume_token(
+            &v,
+            "shop",
+            legion_proto::v1::ResumeToken {
+                volume: "db".into(),
+            },
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(legion_api::volume::receive_busy(e.message()), "{e:?}");
+        assert!(v.receiving(&v.dataset("shop", "other").unwrap()).is_ok());
+        drop(first);
+        assert!(!v.is_receiving(&ds));
+        assert!(v.receiving(&ds).is_ok());
     }
 
     /// A copy that went in just before the leader sending it stopped:

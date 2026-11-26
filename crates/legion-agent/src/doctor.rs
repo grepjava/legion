@@ -101,7 +101,7 @@ const PF_CONF: &str = "/etc/pf.conf";
 /// show before anyone runs it: `{"path", "plan"}`, or why the file could
 /// not be read.
 pub fn pf_fix(path: &str) -> serde_json::Value {
-    use legion_sys::pffix::{self, Files, HostFiles, Hooks};
+    use legion_sys::pffix::{self, Files, Hooks, HostFiles};
     let hooks = Hooks {
         anchor: "legion/*",
         lines: legion_net::lb::HOOKS,

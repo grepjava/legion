@@ -113,7 +113,9 @@ pub(crate) fn host_names(a: &Assignment) -> Vec<String> {
 
 /// A pod's `/etc/hosts`: `localhost`, and `names` at `ip` once known.
 pub(crate) fn hosts_text(names: &[String], ip: Option<std::net::Ipv4Addr>) -> String {
-    let mut out = String::from("127.0.0.1\tlocalhost localhost.my.domain\n::1\t\tlocalhost localhost.my.domain\n");
+    let mut out = String::from(
+        "127.0.0.1\tlocalhost localhost.my.domain\n::1\t\tlocalhost localhost.my.domain\n",
+    );
     if let Some(ip) = ip
         && !names.is_empty()
     {
@@ -221,7 +223,9 @@ pub(crate) async fn prepare<C: Control>(
             .chain(resolv_conf.as_ref().map(String::len))
             .chain(resolv_conf.as_ref().map(|_| 4096)),
     );
-    let hosts = resolv_conf.as_ref().map(|_| hosts_text(&host_names(a), None));
+    let hosts = resolv_conf
+        .as_ref()
+        .map(|_| hosts_text(&host_names(a), None));
     let write = move |sys: &dyn Sys| -> Result<(), String> {
         let path = dir.to_str().ok_or("the files directory is not UTF-8")?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("creating {path}: {e}"))?;
@@ -390,7 +394,12 @@ mod tests {
         assert!(before.starts_with("127.0.0.1	localhost"), "{before}");
         assert!(!before.contains("web-1-1"), "no address yet: {before}");
         let after = hosts_text(&names, Some("10.200.0.7".parse().unwrap()));
-        assert!(after.ends_with("10.200.0.7	web-1-1 shop_web-1-1_app
-"), "{after}");
+        assert!(
+            after.ends_with(
+                "10.200.0.7	web-1-1 shop_web-1-1_app
+"
+            ),
+            "{after}"
+        );
     }
 }

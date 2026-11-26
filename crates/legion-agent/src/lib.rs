@@ -410,6 +410,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 zfs_root: ctx.zfs_root.clone(),
                 lock: ctx.volume_lock.clone(),
                 iscsi: self.iscsi.clone(),
+                receiving: Default::default(),
             }),
             self.builder.clone(),
             ctx.control.sessions(&ctx.node),
@@ -1346,7 +1347,15 @@ async fn heartbeats<R: Runtime, C: Control>(
             .cloned()
             .collect();
         match control
-            .heartbeat(&node, usage, held, telemetry, sending, read.clone(), reports)
+            .heartbeat(
+                &node,
+                usage,
+                held,
+                telemetry,
+                sending,
+                read.clone(),
+                reports,
+            )
             .await
         {
             Ok(p) => {
@@ -1463,14 +1472,12 @@ async fn reconcile<R: Runtime, C: Control>(
                 } else if wanted && !w.stopping {
                     // Told again on the next reconcile if the worker's
                     // queue is full.
-                    if w.paused != a.spec.paused
-                        && w.tx.try_send(Msg::Pause(a.spec.paused)).is_ok()
+                    if w.paused != a.spec.paused && w.tx.try_send(Msg::Pause(a.spec.paused)).is_ok()
                     {
                         w.paused = a.spec.paused;
                     }
                     if w.replication != a.spec.replication
-                        && w
-                            .tx
+                        && w.tx
                             .try_send(Msg::Replication(a.spec.replication.clone().map(Box::new)))
                             .is_ok()
                     {

@@ -365,6 +365,13 @@ members are told their role only on nodes that read it.
   PostgreSQL plugin now archives what PostgreSQL finished but had not
   archived, and waits until Legion has shipped the spool; only that
   replica waits, the primary taking writes meanwhile.
+- A copy cut short by a leader restart could still lose what it had kept
+  when the new leader asked for the resume token while the receive the
+  old one fed still ran: no token was written yet, the copy was sent
+  whole again, and the receiving node destroyed the part kept (seen on
+  jax-pg: 21 GB). The agent now says a receive is under way instead,
+  which the manager waits out, and refuses a second receive into the same
+  dataset meanwhile.
 - A copy cut short by a leader restart could lose what it had kept: the
   receive the old leader fed held the dataset for over 20 s after its
   sender was gone, the new leader's attempts to go on were refused as busy
