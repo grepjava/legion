@@ -247,6 +247,14 @@ pub(crate) async fn demote(
             "manager {node} is not asked to become a worker"
         )));
     }
+    // Out of the membership it would step down before it could say so,
+    // revoked, its new certificate lost: it hands leadership over first
+    // (`follow`), and another demotes it (found by an audit).
+    if node == api.name {
+        return Err(Status::failed_precondition(format!(
+            "manager {node} leads: it hands leadership over before it is demoted"
+        )));
+    }
     let issuer = api
         .issuer
         .as_ref()
@@ -303,6 +311,13 @@ pub(crate) async fn follow(
     loop {
         let asked = matches!(wanted(&api.store, &api.name), Ok(Some(Role::Worker)));
         if asked && tx.borrow().is_none() {
+            // A leader is not demoted by itself: it hands over first.
+            if let Some((to, addr)) = successor(&api) {
+                match crate::lead::hand_over(&api, to, &addr).await {
+                    Ok(took) => tracing::info!(to, ?took, "leadership handed over, to be demoted"),
+                    Err(e) => tracing::warn!("handing leadership over, to be demoted: {e}"),
+                }
+            }
             match ask_demotion(&api).await {
                 Ok(d) => {
                     tracing::info!("demoted: this node starts again as a worker");
@@ -316,6 +331,31 @@ pub(crate) async fn follow(
             _ = closing.changed() => return,
         }
     }
+}
+
+/// While this manager leads: the manager to hand leadership to, one that
+/// may lead (no witness), the most caught up first, and where it is.
+fn successor(api: &ApiService) -> Option<(legion_store::NodeId, String)> {
+    let m = api.store.raft.metrics().borrow().clone();
+    if m.current_leader != Some(m.id) {
+        return None;
+    }
+    let witnesses = crate::managers::witnesses(&api.store).ok()?;
+    let membership = m.membership_config.membership();
+    let matched = |id: &legion_store::NodeId| {
+        m.replication
+            .as_ref()
+            .and_then(|r| r.get(id))
+            .and_then(|l| l.map(|l| l.index))
+    };
+    membership
+        .voter_ids()
+        .filter(|id| *id != m.id && !witnesses.contains(id))
+        .max_by_key(matched)
+        .and_then(|id| {
+            let addr = membership.get_node(&id)?.addr.clone();
+            Some((id, addr))
+        })
 }
 
 async fn ask_demotion(api: &ApiService) -> Result<Demoted, Status> {

@@ -103,7 +103,11 @@ fn a_worker_and_a_manager_change_roles_in_place() {
     eprintln!("promoted in {:.0} s", started.elapsed().as_secs_f64());
     assert_eq!(running(&lab), tasks, "the tasks ran on");
 
-    step("the manager n3 demoted: a worker, out of the membership, its task running on");
+    // The leader asked to become a worker: out of the membership it would
+    // step down before it could write so down, revoked and its new
+    // certificate lost (found by an audit); it hands leadership over first.
+    step("the manager n3, leading, demoted: a worker, out of the membership, its task running on");
+    lab.ok(&["node", "lead", "n3"]);
     let started = std::time::Instant::now();
     lab.ok(&["node", "demote", "n3"]);
     wait("n3 a worker, ready", 300, || {

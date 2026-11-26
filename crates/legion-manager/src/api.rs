@@ -99,6 +99,33 @@ pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
     }
 }
 
+/// Whether the voter `id` (`name`) may leave the membership `voters`, as
+/// the manager `me`: see [`ApiService::leave_membership`].
+fn leaving_voter(
+    name: &str,
+    id: NodeId,
+    me: NodeId,
+    voters: &std::collections::BTreeSet<NodeId>,
+    witnesses: &std::collections::HashSet<NodeId>,
+) -> Result<(), Status> {
+    if voters.len() == 1 {
+        return Err(Status::failed_precondition(format!(
+            "manager {name} is the cluster's last voter: it cannot be removed"
+        )));
+    }
+    if !voters.iter().any(|v| *v != id && !witnesses.contains(v)) {
+        return Err(Status::failed_precondition(format!(
+            "manager {name} is the last that may lead, the others witnesses: promote another first"
+        )));
+    }
+    if id == me {
+        return Err(Status::failed_precondition(format!(
+            "manager {name} leads: hand leadership to another first (`legion node lead MANAGER`)"
+        )));
+    }
+    Ok(())
+}
+
 impl ApiService {
     /// The managers as Raft's membership and their own word have them, by
     /// name, and the leader's name (empty when there is none).
@@ -1141,9 +1168,15 @@ impl ApiService {
     }
 
     /// Takes the manager named `name` out of the Raft membership, if it is
-    /// a member: never the last voter.
+    /// a member: never the last voter, never the last that may lead (the
+    /// others witnesses, which never stand), never this leader itself (it
+    /// steps down once out, before it could write anything after: it hands
+    /// leadership over first). One at a time, so that two removals cannot
+    /// each leave the other's manager the last (found by an audit).
     pub(crate) async fn leave_membership(&self, name: &str) -> Result<(), Status> {
         use openraft::ChangeMembers;
+        static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one = ONE_AT_A_TIME.lock().await;
         let Some(id) = crate::managers::id_of(&self.store, name)? else {
             return Ok(());
         };
@@ -1151,11 +1184,8 @@ impl ApiService {
         let membership = m.membership_config.membership();
         let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
         let change = if voters.contains(&id) {
-            if voters.len() == 1 {
-                return Err(Status::failed_precondition(format!(
-                    "manager {name} is the cluster's last voter: it cannot be removed"
-                )));
-            }
+            let witnesses = crate::managers::witnesses(&self.store)?;
+            leaving_voter(name, id, m.id, &voters, &witnesses)?;
             ChangeMembers::RemoveVoters([id].into())
         } else if membership.nodes().any(|(n, _)| *n == id) {
             ChangeMembers::RemoveNodes([id].into())
@@ -3371,4 +3401,34 @@ fn pod_limits(pod: &legion_api::service::PodSpec) -> (Option<u64>, Option<u64>) 
         sum(&|c| c.resources.limits.cpu.map(|v| v.0)),
         sum(&|c| c.resources.limits.memory.map(|v| v.0)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Status;
+
+    /// Found by an audit: deleting the last manager that may lead left
+    /// witnesses alone, which never stand; deleting or demoting the leader
+    /// had it step down before it could write so down.
+    #[test]
+    fn a_voter_leaves_only_with_one_that_may_lead_left_and_not_the_leader() {
+        let set = |ids: &[u64]| {
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let none = std::collections::HashSet::new();
+        let witness: std::collections::HashSet<u64> = [3].into();
+        let e = |r: Result<(), Status>| r.unwrap_err().message().to_owned();
+        assert!(e(super::leaving_voter("n1", 1, 2, &set(&[1]), &none)).contains("last voter"));
+        // Two full managers and a witness: one may go, not both.
+        assert!(super::leaving_voter("n2", 2, 1, &set(&[1, 2, 3]), &witness).is_ok());
+        assert!(
+            e(super::leaving_voter("n2", 2, 1, &set(&[2, 3]), &witness))
+                .contains("last that may lead")
+        );
+        // Never the leader itself.
+        assert!(e(super::leaving_voter("n1", 1, 1, &set(&[1, 2, 3]), &witness)).contains("leads"));
+        assert!(super::leaving_voter("n3", 3, 1, &set(&[1, 2, 3]), &witness).is_ok());
+    }
 }

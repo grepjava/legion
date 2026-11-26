@@ -308,6 +308,16 @@ members are told their role only on nodes that read it.
   into an image and push it. The context, and the files a build reads
   straight from it, must now resolve inside the clone; links within the
   repository still work.
+- Demoting the manager that leads stranded it: out of the membership it
+  stepped down before it could write the change down, its manager
+  certificate already revoked and its worker certificate never handed
+  back, so it could only join again by hand. It now hands leadership to
+  another manager first, and no manager demotes itself. Deleting the
+  leader's Node is refused with the same advice (`legion node lead`),
+  and the last manager that may lead can no longer be deleted while only
+  witnesses would remain (they never stand: the cluster would have no
+  leader for good); removals go one at a time, so two cannot each leave
+  the other's the last (found by an audit).
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion
