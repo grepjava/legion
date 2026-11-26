@@ -236,18 +236,19 @@ spec:
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
+    // The dataset as the agent words it, quoted for the remote shell.
     let out = lab.on(
         "n2",
         &format!(
             "set -e
             dd if=/dev/urandom of=\"$(zfs get -H -o value mountpoint {dataset})/ballast\" bs=1m count=300 2>/dev/null
             i=0
-            until pgrep -qf 'ssh .*zfs receive -s -u {BK_DATASET}'; do
+            until pgrep -qf 'ssh .*zfs receive -s -u .?{BK_DATASET}'; do
                 i=$((i + 1)); [ $i -lt 3000 ] || {{ echo 'no backup came' >&2; exit 3; }}
                 sleep 0.1
             done
             sleep 1
-            pkill -KILL -f 'ssh .*zfs receive -s -u {BK_DATASET}'"
+            pkill -KILL -f 'ssh .*zfs receive -s -u .?{BK_DATASET}'"
         ),
     );
     assert!(out.status.success(), "cutting a backup short: {}", text(&out.stderr));
