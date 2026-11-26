@@ -98,7 +98,10 @@ async fn write(
     parts: Vec<String>,
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
-    let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
+    // Waited on, not blocked on, when the writer falls behind: a blocking
+    // send held a worker thread of the agent's runtime while the disk was
+    // slow (found by an audit).
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(16);
     let writing = tokio::task::spawn_blocking(move || imp::write(&root, &parts, data_rx));
     let fed = async {
         loop {
@@ -106,14 +109,14 @@ async fn write(
                 Some(SessionFrame {
                     frame: Some(Frame::Input(data)),
                 }) => {
-                    if data_tx.send(Some(data)).is_err() {
+                    if data_tx.send(Some(data)).await.is_err() {
                         return Ok(());
                     }
                 }
                 Some(SessionFrame {
                     frame: Some(Frame::InputClosed(_)),
                 }) => {
-                    let _ = data_tx.send(None);
+                    let _ = data_tx.send(None).await;
                     return Ok(());
                 }
                 Some(_) => continue,
@@ -261,9 +264,11 @@ mod imp {
 
     pub(super) fn list(root: &Path, parts: &[String]) -> Result<Vec<Entry>, Status> {
         let dir = walk(root, parts)?;
-        // fdopendir takes a descriptor of its own, closed by closedir.
+        // fdopendir takes a descriptor of its own, closed by closedir;
+        // close-on-exec, so a process the agent starts meanwhile does not
+        // get a descriptor in the container's tree (found by an audit).
         // SAFETY: a valid descriptor.
-        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+        let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
             return Err(status("listing", std::io::Error::last_os_error()));
         }
@@ -356,7 +361,7 @@ mod imp {
     pub(super) fn write(
         root: &Path,
         parts: &[String],
-        data: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
+        mut data: tokio::sync::mpsc::Receiver<Option<Vec<u8>>>,
     ) -> Result<(), Status> {
         let (dir, name) = split(root, parts, "write")?;
         let at = format!("/{}", parts.join("/"));
@@ -378,10 +383,10 @@ mod imp {
             e
         };
         loop {
-            match data.recv() {
-                Ok(Some(chunk)) => file.write_all(&chunk).map_err(|e| gone(status(&at, e)))?,
-                Ok(None) => break,
-                Err(_) => return Err(gone(Status::cancelled("the upload ended"))),
+            match data.blocking_recv() {
+                Some(Some(chunk)) => file.write_all(&chunk).map_err(|e| gone(status(&at, e)))?,
+                Some(None) => break,
+                None => return Err(gone(Status::cancelled("the upload ended"))),
             }
         }
         file.sync_all().map_err(|e| gone(status(&at, e)))?;
@@ -431,7 +436,7 @@ mod imp {
     pub(super) fn write(
         _: &Path,
         _: &[String],
-        _: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
+        _: tokio::sync::mpsc::Receiver<Option<Vec<u8>>>,
     ) -> Result<(), Status> {
         Err(unsupported())
     }
@@ -492,9 +497,9 @@ mod tests {
         assert_eq!(got, b"sshd_enable=YES\n");
 
         // Written in place of a link, the link goes, not what it points to.
-        let (data, rx) = std::sync::mpsc::sync_channel(4);
-        data.send(Some(b"kept in".to_vec())).unwrap();
-        data.send(None).unwrap();
+        let (data, rx) = tokio::sync::mpsc::channel(4);
+        data.blocking_send(Some(b"kept in".to_vec())).unwrap();
+        data.blocking_send(None).unwrap();
         imp::write(root.path(), &components("/etc/secret").unwrap(), rx).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("etc/secret")).unwrap(),
@@ -506,8 +511,8 @@ mod tests {
         );
 
         // An upload cut short leaves nothing behind.
-        let (data, rx) = std::sync::mpsc::sync_channel(4);
-        data.send(Some(b"half".to_vec())).unwrap();
+        let (data, rx) = tokio::sync::mpsc::channel(4);
+        data.blocking_send(Some(b"half".to_vec())).unwrap();
         drop(data);
         assert!(imp::write(root.path(), &components("/etc/new").unwrap(), rx).is_err());
         let left: Vec<_> = std::fs::read_dir(root.path().join("etc"))

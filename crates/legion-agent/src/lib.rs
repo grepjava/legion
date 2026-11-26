@@ -1559,8 +1559,15 @@ async fn reconcile<R: Runtime, C: Control>(
         let ctx = ctx.clone();
         let keep = assignments.contains_key(&uid);
         cleanups.spawn(async move {
-            // Found again by a reconcile while anything is left.
-            let gone = task::teardown(&ctx, &uid, grace, keep).await;
+            use futures::FutureExt;
+            // Found again by a reconcile while anything is left. A teardown
+            // that panicked comes back as not gone: its uid would otherwise
+            // stay among those being cleaned until the agent restarts, and
+            // nothing would start, remove or report it (found by an audit).
+            let gone = std::panic::AssertUnwindSafe(task::teardown(&ctx, &uid, grace, keep))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err("removing what is left panicked".into()));
             if let Err(e) = &gone {
                 tracing::warn!(uid, "removing what is left: {e}");
             }
