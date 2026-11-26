@@ -485,6 +485,10 @@ impl Volumes for VolumesService {
             namespace
         };
         check_namespace(&namespace)?;
+        // Its name makes the path or key its backups are under: a name it
+        // could not have would reach another Volume's (seen in an audit).
+        legion_api::validate_name(&name)
+            .map_err(|e| Status::invalid_argument(format!("the Volume's name: {e}")))?;
         self.api.consistent().await?;
         caller.check(&self.api.store, Verb::Read, Kind::Volume, &namespace)?;
         let key = ObjectKey::new(Kind::Volume, &namespace, &name);
@@ -550,6 +554,8 @@ impl Volumes for VolumesService {
             } = req.into_inner();
             let namespace = if namespace.is_empty() { "default".to_owned() } else { namespace };
             check_namespace(&namespace)?;
+            legion_api::validate_name(&name)
+                .map_err(|e| Status::invalid_argument(format!("the backed-up Volume's name: {e}")))?;
             self.api.consistent().await?;
             caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
             let into = if into.is_empty() { name.clone() } else { into };
@@ -577,35 +583,29 @@ impl Volumes for VolumesService {
             };
             let access = crate::backups::access(&self.api.store, &target).map_err(Status::failed_precondition)?;
             let of = format!("{namespace}.{name}");
-            // Named by its snapshot: found among what the target holds.
-            let held = if backup.contains('@') || backup.contains('/') {
-                backup.clone()
-            } else {
-                let mut a = crate::backups::open(
-                    &self.api.sessions,
-                    &node,
-                    &namespace,
-                    Action::BackupList(legion_proto::v1::BackupList {
-                        volume: name.clone(),
-                        target: Some(access.clone()),
-                    }),
-                )
+            // Only one the target lists for this Volume, named by its
+            // snapshot or as listed: never a name taken as given, which
+            // reached a remote shell and other namespaces' backups (seen
+            // in an audit).
+            let mut a = crate::backups::open(
+                &self.api.sessions,
+                &node,
+                &namespace,
+                Action::BackupList(legion_proto::v1::BackupList {
+                    volume: name.clone(),
+                    target: Some(access.clone()),
+                }),
+            )
+            .await
+            .map_err(Status::unavailable)?;
+            let (_, listed) = crate::backups::said(&mut a, &node)
                 .await
-                .map_err(Status::unavailable)?;
-                let (_, listed) = crate::backups::said(&mut a, &node)
-                    .await
-                    .map_err(Status::failed_precondition)?;
-                listed
-                    .into_iter()
-                    .find(|h| {
-                        h.rsplit(['@', '/']).next().map(|n| n.trim_end_matches(".zfs")) == Some(backup.as_str())
-                    })
-                    .ok_or_else(|| {
-                        Status::not_found(format!(
-                            "{target} holds no backup {backup} of {name}: `legion volume backups {name}` lists them"
-                        ))
-                    })?
-            };
+                .map_err(Status::failed_precondition)?;
+            let held = listed_backup(listed, &backup).ok_or_else(|| {
+                Status::not_found(format!(
+                    "{target} holds no backup {backup} of {name}: `legion volume backups {name}` lists them"
+                ))
+            })?;
             let op = self.api.activity.begin(
                 legion_api::activity::OperationKind::Restore,
                 crate::audit::target("Volume", &namespace, &into),
@@ -1148,6 +1148,18 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Of the backups a target `listed` for a Volume, the one `backup` names:
+/// by its snapshot (`legion-bk-...`), or exactly as listed.
+fn listed_backup(listed: Vec<String>, backup: &str) -> Option<String> {
+    listed.into_iter().find(|h| {
+        h == backup
+            || h.rsplit(['@', '/'])
+                .next()
+                .map(|n| n.trim_end_matches(".zfs"))
+                == Some(backup)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,5 +1251,38 @@ mod tests {
                 .unwrap_err()
                 .contains("is lost")
         );
+    }
+
+    /// A restore takes only a backup the target lists for the Volume: by
+    /// its snapshot, or exactly as listed; never a name as given (seen in
+    /// an audit: one reached a remote shell, another a path through `..`).
+    #[test]
+    fn a_restore_takes_only_a_listed_backup() {
+        let listed = || {
+            vec![
+                "tank/bk/shop.db@legion-bk-t-20261122T010000Z".to_owned(),
+                "/var/backups/shop.db/legion-bk-d-20261122T020000Z.zfs".to_owned(),
+            ]
+        };
+        assert_eq!(
+            super::listed_backup(listed(), "legion-bk-t-20261122T010000Z").as_deref(),
+            Some("tank/bk/shop.db@legion-bk-t-20261122T010000Z")
+        );
+        assert_eq!(
+            super::listed_backup(listed(), "legion-bk-d-20261122T020000Z").as_deref(),
+            Some("/var/backups/shop.db/legion-bk-d-20261122T020000Z.zfs")
+        );
+        assert_eq!(
+            super::listed_backup(listed(), "tank/bk/shop.db@legion-bk-t-20261122T010000Z")
+                .as_deref(),
+            Some("tank/bk/shop.db@legion-bk-t-20261122T010000Z")
+        );
+        for bad in [
+            "tank/bk/shop.db@legion-bk-t-20261122T010000Z;id",
+            "/var/backups/shop.db/../bank.ledger/legion-bk-d-20261122T020000Z.zfs",
+            "legion-bk-nope",
+        ] {
+            assert_eq!(super::listed_backup(listed(), bad), None, "{bad}");
+        }
     }
 }

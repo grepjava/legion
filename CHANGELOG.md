@@ -288,6 +288,22 @@ members are told their role only on nodes that read it.
 
 ### Fixed
 
+- **Security: restoring from a backup target.** `Volumes.RestoreFrom`
+  took a backup's full name as given: on an SSH target it reached the
+  remote shell unquoted (`zfs send <name>`), so anyone who may write
+  Volumes in a namespace could run commands as the target's account; on a
+  directory target a path through `..` restored another namespace's
+  backup, and `Volumes.Backups` listed another Volume's for a name with
+  `/` in it (found by an audit). A restore now takes only a backup the
+  target lists for that Volume (by its snapshot, or exactly as listed),
+  both calls check the Volume's name, and agents take only names of the
+  Volume's own chains (in ZFS's characters, every word quoted for the
+  remote shell), files right in its own directory, and a Volume of the
+  session's namespace.
+- A replicated database's member not running (an old primary being
+  rewound to rejoin) had its spool shipped only once it ran again, while
+  the PostgreSQL plugin now waits for it to be shipped first: Legion
+  ships it from the spool the other members report.
 - Usage charts dipped when nodes were sampled in different steps: each
   series now counts once per step, its latest sample held.
 - A replica whose attempts kept failing turned back from stale to failed;

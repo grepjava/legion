@@ -64,6 +64,29 @@ pub(crate) trait Remote: Send + Sync {
 
 /// The snapshot a held backup is: `legion-bk-offsite-…` from
 /// `tank/b/shop.db.2026…@legion-bk-offsite-…` or `/mnt/b/shop.db/legion-bk-offsite-….zfs`.
+/// Whether `name` has only characters ZFS names (and backup files) use,
+/// none a shell gives meaning to, and does not start as an option would.
+pub(crate) fn plain_zfs(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '@' | ':'))
+}
+
+/// `s` as one word for the remote's POSIX shell.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Whether `of` is `<namespace>.<volume>`: a Volume of `namespace`, by a
+/// name a Volume may have.
+fn of_namespace(namespace: &str, of: &str) -> bool {
+    of.strip_prefix(namespace)
+        .and_then(|r| r.strip_prefix('.'))
+        .is_some_and(|name| legion_api::validate_name(name).is_ok())
+}
+
 pub(crate) fn snapshot_of(held: &str) -> &str {
     let name = held.rsplit(['@', '/', '\\']).next().unwrap_or(held);
     name.strip_suffix(".zfs").unwrap_or(name)
@@ -298,6 +321,24 @@ impl Directory {
     }
 }
 
+impl Directory {
+    /// `held` as one of this Volume's backups: a file right in its
+    /// directory, named as a backup is. Compared as written, so `..` or a
+    /// path elsewhere is refused, not resolved (seen in an audit: a path
+    /// through `..` reached another namespace's backups).
+    fn held<'a>(&self, held: &'a str) -> Result<&'a std::path::Path, String> {
+        let path = std::path::Path::new(held);
+        let named = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".zfs") && !n.starts_with('.') && plain_zfs(n));
+        if !named || path.parent() != Some(self.dir.as_path()) {
+            return Err(format!("{held} is not one of this Volume's backups"));
+        }
+        Ok(path)
+    }
+}
+
 impl Remote for Directory {
     fn list(&self) -> Result<Vec<String>, String> {
         let mut found: Vec<String> = match std::fs::read_dir(&self.dir) {
@@ -338,13 +379,11 @@ impl Remote for Directory {
         Ok(path.to_string_lossy().into_owned())
     }
     fn destroy(&self, held: &str) -> Result<(), String> {
-        std::fs::remove_file(held).map_err(|e| format!("removing {held}: {e}"))
+        let path = self.held(held)?;
+        std::fs::remove_file(path).map_err(|e| format!("removing {held}: {e}"))
     }
     fn send(&self, held: &str, out: &mut dyn Write) -> Result<(), String> {
-        let path = std::path::Path::new(held);
-        if !path.starts_with(&self.dir) {
-            return Err(format!("{held} is not one of this Volume's backups"));
-        }
+        let path = self.held(held)?;
         let mut f = std::fs::File::open(path).map_err(|e| format!("opening {held}: {e}"))?;
         std::io::copy(&mut f, out)
             .map(drop)
@@ -471,13 +510,26 @@ impl Ssh {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Whether `name` (a dataset or snapshot) is one of this Volume's.
+    /// Whether `name` (a dataset or snapshot) is one of this Volume's:
+    /// `<base>` or `<base>.<when>`, then at most one `@<snapshot>`, in
+    /// ZFS's characters only. Every name that reaches the remote shell
+    /// passes here (and is quoted besides).
     fn ours(&self, name: &str) -> bool {
-        let dataset = name.split('@').next().unwrap_or(name);
-        dataset == self.base
+        if !plain_zfs(name) {
+            return false;
+        }
+        let (dataset, snapshot) = match name.split_once('@') {
+            Some((d, s)) => (d, Some(s)),
+            None => (name, None),
+        };
+        let chain = dataset == self.base
             || dataset
                 .strip_prefix(&self.base)
-                .is_some_and(|r| r.starts_with('.'))
+                .and_then(|r| r.strip_prefix('.'))
+                .is_some_and(|when| {
+                    !when.is_empty() && when.chars().all(|c| c.is_ascii_alphanumeric())
+                });
+        chain && snapshot.is_none_or(|s| !s.is_empty() && !s.contains(['@', '/']))
     }
 }
 
@@ -485,7 +537,7 @@ impl Remote for Ssh {
     fn list(&self) -> Result<Vec<String>, String> {
         let said = self.ask(&format!(
             "zfs list -H -p -o name -t snapshot -s createtxg -r {} 2>/dev/null || true",
-            self.target.dataset
+            quoted(&self.target.dataset)
         ))?;
         let mut found: Vec<String> = said
             .lines()
@@ -511,7 +563,8 @@ impl Remote for Ssh {
         // What changed goes where its base is; a whole one starts a
         // dataset of its own, named for when.
         let dataset = match base {
-            Some(b) => b.split('@').next().unwrap_or(b).to_owned(),
+            Some(b) if self.ours(b) => b.split('@').next().unwrap_or(b).to_owned(),
+            Some(b) => return Err(format!("{b} is not one of this Volume's backups")),
             None => format!(
                 "{}.{}",
                 self.base,
@@ -524,7 +577,7 @@ impl Remote for Ssh {
     fn partial(&self) -> Result<Option<(String, String)>, String> {
         let said = self.ask(&format!(
             "zfs get -H -o name,value -r -t filesystem receive_resume_token {} 2>/dev/null || true",
-            self.target.dataset
+            quoted(&self.target.dataset)
         ))?;
         Ok(said.lines().find_map(|l| {
             let (name, token) = l.trim().split_once('\t')?;
@@ -548,7 +601,8 @@ impl Remote for Ssh {
         if !self.ours(dataset) {
             return Err(format!("{dataset} is not one of this Volume's backups"));
         }
-        self.ask(&format!("zfs receive -A {dataset}")).map(drop)
+        self.ask(&format!("zfs receive -A {}", quoted(dataset)))
+            .map(drop)
     }
     fn destroy(&self, held: &str) -> Result<(), String> {
         self.destroy_held(held)
@@ -562,8 +616,11 @@ impl Ssh {
     /// `zfs receive -s -u` there: cut short, what came is kept to go on
     /// with.
     fn receive_into(&self, dataset: &str, input: &mut dyn Read) -> Result<(), String> {
+        if !self.ours(dataset) {
+            return Err(format!("{dataset} is not one of this Volume's backups"));
+        }
         let mut child = self
-            .command(&format!("zfs receive -s -u {dataset}"))
+            .command(&format!("zfs receive -s -u {}", quoted(dataset)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -590,12 +647,15 @@ impl Ssh {
         if !self.ours(held) || !held.contains('@') {
             return Err(format!("{held} is not one of this Volume's backups"));
         }
-        self.ask(&format!("zfs destroy {held}"))?;
+        self.ask(&format!("zfs destroy {}", quoted(held)))?;
         // A dataset left with no backups goes too.
         let dataset = held.split('@').next().unwrap_or(held);
-        let left = self.ask(&format!("zfs list -H -o name -t snapshot -d 1 {dataset}"))?;
+        let left = self.ask(&format!(
+            "zfs list -H -o name -t snapshot -d 1 {}",
+            quoted(dataset)
+        ))?;
         if left.trim().is_empty() {
-            self.ask(&format!("zfs destroy {dataset}"))?;
+            self.ask(&format!("zfs destroy {}", quoted(dataset)))?;
         }
         Ok(())
     }
@@ -604,7 +664,7 @@ impl Ssh {
             return Err(format!("{held} is not one of this Volume's backups"));
         }
         let mut child = self
-            .command(&format!("zfs send {held}"))
+            .command(&format!("zfs send {}", quoted(held)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -630,8 +690,14 @@ impl Ssh {
 /// The target an action names, reached for the Volume `of`.
 fn reach(
     t: Option<&legion_proto::v1::BackupTargetAccess>,
+    namespace: &str,
     of: &str,
 ) -> Result<Box<dyn Remote>, tonic::Status> {
+    if !of_namespace(namespace, of) {
+        return Err(tonic::Status::invalid_argument(format!(
+            "{of:?} is no Volume of namespace {namespace}"
+        )));
+    }
     let t = t.ok_or_else(|| tonic::Status::invalid_argument("no target"))?;
     let spec: BackupTargetSpec = serde_json::from_str(&t.spec_json)
         .map_err(|e| tonic::Status::invalid_argument(format!("target {}: {e}", t.name)))?;
@@ -651,10 +717,16 @@ pub(crate) async fn run_session(
 ) -> Result<(), tonic::Status> {
     use legion_proto::v1::session_frame::Frame;
     let ds = v.dataset(namespace, &o.volume)?;
-    let remote = reach(o.target.as_ref(), &format!("{namespace}.{}", o.volume))?;
+    let remote = reach(
+        o.target.as_ref(),
+        namespace,
+        &format!("{namespace}.{}", o.volume),
+    )?;
     if !o
         .snapshot
         .starts_with(legion_api::backup::BackupSchedule::PREFIX)
+        || !plain_zfs(&o.snapshot)
+        || o.snapshot.contains(['@', '/'])
     {
         return Err(tonic::Status::invalid_argument(
             "a backup's snapshot is named legion-bk-<target>-<time>",
@@ -688,7 +760,11 @@ pub(crate) async fn list_session(
     tx: &tokio::sync::mpsc::Sender<legion_proto::v1::SessionFrame>,
 ) -> Result<(), tonic::Status> {
     use legion_proto::v1::session_frame::Frame;
-    let remote = reach(o.target.as_ref(), &format!("{namespace}.{}", o.volume))?;
+    let remote = reach(
+        o.target.as_ref(),
+        namespace,
+        &format!("{namespace}.{}", o.volume),
+    )?;
     let held = crate::task::blocking(&v.sys, move |_| remote.list())
         .await
         .map_err(tonic::Status::failed_precondition)?;
@@ -710,7 +786,7 @@ pub(crate) async fn restore_session(
 ) -> Result<(), tonic::Status> {
     use legion_proto::v1::session_frame::Frame;
     let ds = v.dataset(namespace, &o.volume)?;
-    let remote = reach(o.target.as_ref(), &o.of)?;
+    let remote = reach(o.target.as_ref(), namespace, &o.of)?;
     let lock = v.lock.clone();
     crate::task::blocking(&v.sys, move |sys| {
         restore(sys, &lock, remote.as_ref(), &ds, &o.held)
@@ -1035,5 +1111,101 @@ mod tests {
             snapshot_of("/mnt/b/shop.db/legion-bk-o-20261122T010000Z.zfs"),
             "legion-bk-o-20261122T010000Z"
         );
+    }
+
+    /// Seen in an audit: a restore took a backup's name as given, and an
+    /// SSH target ran it in a remote shell (`...@legion-bk-x;cmd`). Only a
+    /// name of this Volume's chains, in ZFS's characters, is taken, and
+    /// every word is quoted besides.
+    #[test]
+    fn an_ssh_target_takes_only_this_volumes_names() {
+        let t = legion_api::backup::SshTarget {
+            host: "bk".into(),
+            port: 22,
+            user: "legion".into(),
+            dataset: "tank/bk".into(),
+            host_key: "ssh-ed25519 AAAA".into(),
+            ..Default::default()
+        };
+        let ssh = Ssh::new(&t, b"key", "shop.db").unwrap();
+        for ok in [
+            "tank/bk/shop.db",
+            "tank/bk/shop.db@legion-bk-t-20261122T143005Z",
+            "tank/bk/shop.db.20261122T143005Z@legion-bk-t-20261122T143005Z",
+        ] {
+            assert!(ssh.ours(ok), "{ok}");
+        }
+        for bad in [
+            "tank/bk/shop.db@legion-bk-t-1;rm -rf /",
+            "tank/bk/shop.db@legion-bk-t-1 $(id)",
+            "tank/bk/shop.db.x;id@legion-bk-t-1",
+            "tank/bk/shop.db.1@a@b",
+            "tank/bk/shop.db@a/b",
+            "tank/bk/shop.db@",
+            "tank/bk/shop.db.@s",
+            "tank/bk/shop.dbx@s",
+            "tank/bk/other.db@s",
+            "tank/bk/shop.db.1/../../other.db@s",
+        ] {
+            assert!(!ssh.ours(bad), "{bad}");
+        }
+        assert_eq!(quoted("tank/bk"), "'tank/bk'");
+        assert_eq!(quoted("a'b"), "'a'\\''b'");
+        let mut out = Vec::new();
+        let e = ssh
+            .send("tank/bk/shop.db@legion-bk-t-1;id", &mut out)
+            .unwrap_err();
+        assert!(e.contains("not one of this Volume's backups"), "{e}");
+    }
+
+    /// Seen in an audit: a directory target compared paths as written, so
+    /// `<dir>/<ns>.<vol>/../<other ns>.<vol>/...` restored another
+    /// namespace's backup. Only a file right in this Volume's directory is
+    /// taken.
+    #[test]
+    fn a_directory_target_takes_only_files_in_this_volumes_directory() {
+        let d = Directory::new(
+            &legion_api::backup::DirectoryTarget {
+                path: "/var/backups".into(),
+            },
+            "shop.db",
+        );
+        let ours = d.dir.join("legion-bk-t-20261122T143005Z.zfs");
+        assert!(d.held(&ours.to_string_lossy()).is_ok());
+        let other = d
+            .dir
+            .join("..")
+            .join("bank.ledger")
+            .join("legion-bk-t-1.zfs");
+        for bad in [
+            other.to_string_lossy().into_owned(),
+            "/var/backups/bank.ledger/legion-bk-t-1.zfs".to_owned(),
+            d.dir
+                .join("sub")
+                .join("x.zfs")
+                .to_string_lossy()
+                .into_owned(),
+            d.dir.join("x.part").to_string_lossy().into_owned(),
+            d.dir.join("x.zfs;id").to_string_lossy().into_owned(),
+            "/etc/passwd".to_owned(),
+        ] {
+            assert!(d.held(&bad).is_err(), "{bad}");
+            assert!(d.destroy(&bad).is_err(), "{bad}");
+            assert!(d.send(&bad, &mut Vec::new()).is_err(), "{bad}");
+        }
+    }
+
+    /// A manager's `of` is a Volume of the session's own namespace.
+    #[test]
+    fn a_target_is_reached_only_for_a_volume_of_the_sessions_namespace() {
+        assert!(of_namespace("shop", "shop.db"));
+        assert!(!of_namespace("shop", "bank.ledger"));
+        assert!(!of_namespace("shop", "shop."));
+        assert!(!of_namespace("shop", "shop.db/../../bank.ledger"));
+        assert!(!of_namespace("shop", "shopx.db"));
+        assert!(plain_zfs("tank/bk/shop.db@legion-bk-t-1"));
+        assert!(!plain_zfs("-oProxyCommand=x"));
+        assert!(!plain_zfs("a b"));
+        assert!(!plain_zfs(""));
     }
 }
