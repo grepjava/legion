@@ -348,6 +348,12 @@ members are told their role only on nodes that read it.
   manager follows may ask it to stand (found by an audit). Every manager
   still holds the cluster CA's key, so a removed manager that kept it is
   stopped for good only by rotating the CA (`legion ca rotate`).
+- **Security:** event, build log, connection and load balancer streams
+  went on after the user's rights to them were taken; they now end within
+  a few seconds, saying why, as watches and sessions do. A follower no
+  longer checks a build log's rights on its own replica before passing
+  the call on as itself: the leader checks them, for the caller (found
+  by an audit).
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

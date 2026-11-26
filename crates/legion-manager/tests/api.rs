@@ -7664,3 +7664,55 @@ async fn a_volume_the_host_mounts_takes_its_namespaces_leave() {
     let e = volume("setuid", suid).await.unwrap_err();
     assert_eq!(e.code(), Code::InvalidArgument, "{e}");
 }
+
+/// Found by an audit: event, build log, connection and load balancer
+/// streams went on after the user's rights were gone. Like a watch, they
+/// end within a few seconds, saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_users_event_stream_ends_when_their_binding_goes() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut admin = m.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move { admin.apply(binding("shop", "alice", "view")).await }
+    })
+    .await;
+    let mut as_alice = ClusterClient::new(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let mut events = as_alice
+        .events(legion_proto::v1::EventsRequest {
+            namespace: "shop".into(),
+            kind: String::new(),
+            name: String::new(),
+            follow: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    // The backlog, then nothing while she may read.
+    assert!(events.message().await.unwrap().is_some());
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("RoleBinding", "shop", "alice")),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.message().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the stream still runs 15 s after her binding went");
+    let e = ended.unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied, "{e}");
+}

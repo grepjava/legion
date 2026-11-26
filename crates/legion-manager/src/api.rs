@@ -2147,13 +2147,19 @@ impl Cluster for ApiService {
             every: std::time::Duration::from_secs(10),
             ..Wake::default()
         };
-        Ok(Response::new(self.followed(
-            wake,
-            |_| None,
+        let followed = self.followed(wake, |_| None, {
+            let namespace = namespace.clone();
             move |api| {
                 let namespace = namespace.clone();
                 async move { crate::connections::seen(&api, &namespace).await }
-            },
+            }
+        });
+        Ok(Response::new(self.revocable(
+            followed,
+            caller,
+            Verb::Read,
+            Kind::Service,
+            namespace,
         )))
     }
 
@@ -2192,13 +2198,19 @@ impl Cluster for ApiService {
             settle: std::time::Duration::from_secs(1),
             ..Wake::default()
         };
-        Ok(Response::new(self.followed(
-            wake,
-            |_| None,
+        let followed = self.followed(wake, |_| None, {
+            let namespace = namespace.clone();
             move |api| {
                 let namespace = namespace.clone();
                 async move { api.balancers_seen(&namespace) }
-            },
+            }
+        });
+        Ok(Response::new(self.revocable(
+            followed,
+            caller,
+            Verb::Read,
+            Kind::Service,
+            namespace,
         )))
     }
 
@@ -2318,6 +2330,7 @@ impl Cluster for ApiService {
             kind.unwrap_or(Kind::Task),
             &namespace,
         )?;
+        let namespace_checked = namespace.clone();
         let wanted = move |e: &legion_api::event::Event| match kind {
             None => true,
             Some(k) if name.is_empty() => e.kind == k,
@@ -2387,7 +2400,13 @@ impl Cluster for ApiService {
                 }
             });
         }
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(self.revocable(
+            ReceiverStream::new(rx),
+            caller,
+            Verb::Read,
+            kind.unwrap_or(Kind::Task),
+            namespace_checked,
+        )))
     }
 
     async fn dry_run(
@@ -2968,15 +2987,17 @@ impl Cluster for ApiService {
         let caller = self.caller(&req)?;
         let r = req.get_ref().clone();
         check_namespace(&r.namespace)?;
-        caller.check(&self.store, Verb::Read, Kind::Build, &r.namespace)?;
         let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // To the leader as the caller, whose rights it checks once caught
+        // up (found by an audit: a follower checked its own replica and
+        // forwarded the call as itself).
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                 &addr,
                 self.peer_tls.as_ref(),
             ));
             let mut chunks = c
-                .build_logs(forwarded(req.into_inner()))
+                .build_logs(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
             tokio::spawn(async move {
@@ -2992,6 +3013,8 @@ impl Cluster for ApiService {
             return Ok(Response::new(ReceiverStream::new(rx)));
         }
         self.consistent().await?;
+        caller.check(&self.store, Verb::Read, Kind::Build, &r.namespace)?;
+        let namespace = r.namespace.clone();
         let key = ObjectKey::new(Kind::Build, &r.namespace, &r.name);
         let o = self.store.get(&key).map_err(internal)?.ok_or_else(|| {
             Status::not_found(format!("no build {} in namespace {}", r.name, r.namespace))
@@ -3029,7 +3052,13 @@ impl Cluster for ApiService {
                 });
             }
         }
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(self.revocable(
+            ReceiverStream::new(rx),
+            caller,
+            Verb::Read,
+            Kind::Build,
+            namespace,
+        )))
     }
 
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
@@ -3252,6 +3281,47 @@ impl ApiService {
     /// `wake.every`). Ends when the follower goes, the manager closes,
     /// `look` fails (its error the last message), or, for the leader's
     /// work, another manager leads.
+    /// `inner`, ended once `caller` may no longer `verb` `kind` in
+    /// `namespace`, as a watch or a session ends: checked every
+    /// [`crate::authz::REVOCATION_CHECK`], however busy the stream (found
+    /// by an audit: event, build log, connection and load balancer streams
+    /// went on after their rights were gone).
+    pub(crate) fn revocable<T: Send + 'static>(
+        &self,
+        mut inner: ReceiverStream<Result<T, Status>>,
+        caller: Caller,
+        verb: Verb,
+        kind: Kind,
+        namespace: String,
+    ) -> ReceiverStream<Result<T, Status>> {
+        use tokio_stream::StreamExt;
+        let store = self.store.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(crate::authz::REVOCATION_CHECK);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            every.tick().await;
+            loop {
+                tokio::select! {
+                    item = inner.next() => {
+                        let Some(item) = item else { return };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = every.tick() => {
+                        if let Err(e) = caller.check(&store, verb, kind, &namespace) {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                    () = tx.closed() => return,
+                }
+            }
+        });
+        ReceiverStream::new(rx)
+    }
+
     pub(crate) fn followed<T, F, Fut>(
         &self,
         wake: Wake,
