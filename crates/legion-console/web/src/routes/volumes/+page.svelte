@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ask } from '#lib/confirm.svelte.ts';
+  import { lightDismiss } from '#lib/dialog.ts';
   // The Volumes page: per-node ZFS pool capacity meters,
   // 1-click ZFS/NFS/iSCSI volume creation wizard, live per-dataset space
   // tracking, ZFS Snapshot Manager modal, cross-node ZFS migration, and
@@ -121,18 +122,6 @@
     cSize = '';
     cNode = '';
     createDialog?.showModal();
-  }
-
-  function lightDismiss(e: MouseEvent, dlg: HTMLDialogElement | undefined) {
-    if (!dlg || 'closedBy' in HTMLDialogElement.prototype) return;
-    if (e.target !== dlg) return;
-    const r = dlg.getBoundingClientRect();
-    const inside =
-      r.top <= e.clientY &&
-      e.clientY <= r.top + r.height &&
-      r.left <= e.clientX &&
-      e.clientX <= r.left + r.width;
-    if (!inside) dlg.close();
   }
 
   async function submitCreate(e: SubmitEvent) {

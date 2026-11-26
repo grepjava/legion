@@ -414,6 +414,23 @@ form.inline {
 .actions input[type='number'] {
   width: 4.5rem;
 }
+/* A form of fields one under another, each named above it; a radio or a
+   check box named beside it (`label.choice`). */
+.stacked-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.stacked-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.stacked-form label.choice {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.35rem;
+}
 /* A field named beside it, the name as part of its label. */
 .actions .inline-label {
   display: inline-flex;

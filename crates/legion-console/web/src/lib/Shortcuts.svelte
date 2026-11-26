@@ -18,6 +18,7 @@
 <script lang="ts">
   // The keyboard shortcuts, shown by `?` or the side bar's link.
   import { t } from './i18n.svelte.ts';
+  import { lightDismiss } from './dialog.ts';
   import { session } from './session.svelte.ts';
 
   let { open = $bindable(false) } = $props();
@@ -49,6 +50,7 @@
   class="shortcuts"
   aria-labelledby="shortcuts-title"
   closedby="any"
+  onclick={(e) => lightDismiss(e, dialog)}
   onclose={() => (open = false)}
 >
   <header class="bar">

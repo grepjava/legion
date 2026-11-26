@@ -3,6 +3,7 @@
   // live cluster object, or Docks live logs / shell into the Workbench.
   import { goto } from '$app/navigation';
   import { api, type LObject } from './api.ts';
+  import { lightDismiss } from './dialog.ts';
   import { t } from './i18n.svelte.ts';
   import { plural } from './kinds.ts';
   import { cannotWrite, openWorkbench, session, setDensity, setTheme } from './session.svelte.ts';
@@ -34,19 +35,6 @@
   let index = $state(0);
   let objects: LObject[] = $state([]);
   let list: HTMLUListElement | undefined = $state();
-
-  // Light-dismiss fallback for browsers without native <dialog closedby="any">
-  function onDialogClick(event: MouseEvent) {
-    if (!dialog || 'closedBy' in HTMLDialogElement.prototype) return;
-    if (event.target !== dialog) return;
-    const rect = dialog.getBoundingClientRect();
-    const inside =
-      rect.top <= event.clientY &&
-      event.clientY <= rect.top + rect.height &&
-      rect.left <= event.clientX &&
-      event.clientX <= rect.left + rect.width;
-    if (!inside) dialog.close();
-  }
 
   $effect(() => {
     if (!dialog) return;
@@ -251,7 +239,7 @@
   closedby="any"
   aria-labelledby="cmd-palette-title"
   onclose={() => (session.paletteOpen = false)}
-  onclick={onDialogClick}
+  onclick={(e) => lightDismiss(e, dialog)}
   class="palette"
 >
   <header class="palette-head">

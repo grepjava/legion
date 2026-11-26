@@ -288,6 +288,13 @@ members are told their role only on nodes that read it.
 
 ### Fixed
 
+- **Console: the Images page's search no longer repeats endlessly.** On
+  opening the search tab, a search that found nothing, or failed (a
+  registry unreachable), was sent again as soon as it answered, without
+  end. It is now sent once each time the tab opens.
+- **Console: the keyboard shortcuts dialog closes on a click outside it**
+  in browsers without `<dialog closedby>` (Safari), as the other dialogs
+  already did.
 - **Security: restoring from a backup target.** `Volumes.RestoreFrom`
   took a backup's full name as given: on an SSH target it reached the
   remote shell unquoted (`zfs send <name>`), so anyone who may write
