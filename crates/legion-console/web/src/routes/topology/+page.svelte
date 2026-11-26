@@ -11,12 +11,10 @@
     followStatus,
     type Balancer,
     type ConnectionEdge,
-    type ConnectionEnd,
     type LObject,
     type ReachEdge
   } from '#lib/api.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
-  import { logoFor } from '#lib/logos.ts';
   import { cannotWrite, namespaces, session } from '#lib/session.svelte.ts';
   import ContextMenu, { type MenuItem } from '#lib/ContextMenu.svelte';
   import {
@@ -30,6 +28,46 @@
     portMenu,
     routeMenu
   } from '#lib/topology-menu.svelte.ts';
+  import {
+    BAND_HEAD,
+    BAND_W,
+    BAND_X,
+    BOX_H,
+    HEADER_H,
+    NODE_HUES,
+    ROUTE_W,
+    ROW,
+    SVC_R,
+    TASK_H,
+    TASK_STEP,
+    TASK_W,
+    VOL_W,
+    X_ROUTE,
+    X_SVC_CX,
+    X_TASK,
+    X_VOL,
+    conns,
+    containerPorts,
+    isVm,
+    nodeBands,
+    nodeHealth,
+    nodeNote,
+    portShown,
+    portWhere,
+    ports,
+    publishedPorts,
+    routeAddress,
+    seenSummary,
+    serviceHealth,
+    svcNote,
+    taskHealth,
+    tops,
+    volumeUses,
+    width,
+    type Band
+  } from '#lib/topology.ts';
+  import TopologyInspector from '#lib/TopologyInspector.svelte';
+  import TopologyServiceIcon from '#lib/TopologyServiceIcon.svelte';
 
   const mine = $derived(namespaces([]));
   let chosen = $state('');
@@ -199,7 +237,6 @@
       (why) => (seenError = why)
     );
   });
-
   // Reach is read again when services change; the CARP addresses are
   // followed, as CARP moves them.
   const names = $derived(services.map((s) => s.metadata.name).join(','));
@@ -217,22 +254,6 @@
     return followLoadBalancers(ns, (b) => (balancers = b));
   });
 
-  // A row's least height; a service's row grows with its tasks, each
-  // TASK_STEP below the last, so they never reach into the next row.
-  const ROW = 112;
-  const TASK_STEP = 52;
-  const HEADER_H = 34;
-  const X_ROUTE = 24;
-  const ROUTE_W = 168;
-  const X_SVC_CX = 300;
-  const SVC_R = 30;
-  const X_TASK = 440;
-  const TASK_W = 188;
-  const TASK_H = 44;
-  const X_VOL = 700;
-  const VOL_W = 172;
-  const BOX_H = 46;
-
   const svcRow = $derived(new Map(services.map((s, i) => [s.metadata.name, i])));
   const activeTasks = $derived(tasks.filter((tk) => tk.status?.state !== 'shutdown'));
   const tasksBySvc = $derived.by(() => {
@@ -246,93 +267,22 @@
     }
     return m;
   });
-  const used = $derived(
-    services.flatMap((s) =>
-      ((s.spec?.pod?.volumes ?? []) as { volume?: { name: string } }[])
-        .filter((v) => v.volume)
-        .map((v) => ({ service: s.metadata.name, volume: v.volume!.name }))
-    )
-  );
+  const used = $derived(volumeUses(services));
   const volumeNames = $derived(
     [...new Set([...volumes.map((v) => v.metadata.name), ...used.map((u) => u.volume)])].sort()
   );
   const volRow = $derived(new Map(volumeNames.map((v, i) => [v, i])));
   const shownRoutes = $derived(routes.filter((r) => svcRow.has(r.spec?.service)));
-  // Each port a service publishes outside the cluster: through the routing
-  // mesh on every node (`ingress`), or on the nodes running its tasks.
-  type Published = { service: string; what: string; at: number | null; host: boolean };
-  const published: Published[] = $derived(
-    services.flatMap((s) => {
-      const got: { port: number; protocol?: string; publishedPort: number }[] =
-        s.status?.publishedPorts ?? [];
-      return ((s.spec?.endpoint?.ports ?? []) as { port: number; protocol?: string; publish?: string }[])
-        .filter((p) => p.publish === 'ingress' || p.publish === 'host')
-        .map((p) => {
-          const protocol = p.protocol ?? 'tcp';
-          const pub = got.find((g) => g.port === p.port && (g.protocol ?? 'tcp') === protocol);
-          return {
-            service: s.metadata.name,
-            what: `${p.port}/${protocol}`,
-            at: pub?.publishedPort ?? null,
-            host: p.publish === 'host'
-          };
-        });
-    })
-  );
+  const published = $derived(publishedPorts(services));
   const outside = $derived(edges.filter((e) => e.from === '' && svcRow.has(e.to)));
   const between = $derived(
     edges.filter((e) => e.from !== '' && e.from !== e.to && svcRow.has(e.from) && svcRow.has(e.to))
   );
-  // What the nodes saw: between two services, summed over ports and ways;
-  // and into each service from anything but another of them.
-  const isSvc = (e: ConnectionEnd) => e.kind === 'service' && svcRow.has(e.name);
-  type Seen = { from: string; to: string; n: number; what: string[] };
-  const seenBetween: Seen[] = $derived.by(() => {
-    const by = new Map<string, Seen>();
-    for (const e of seen) {
-      if (!isSvc(e.from) || !isSvc(e.to) || e.from.name === e.to.name) continue;
-      const key = `${e.from.name}>${e.to.name}`;
-      const s = by.get(key) ?? { from: e.from.name, to: e.to.name, n: 0, what: [] };
-      s.n += e.connections;
-      s.what.push(`${e.port}/${e.protocol}`);
-      by.set(key, s);
-    }
-    return [...by.values()];
-  });
-  const seenIn: Seen[] = $derived.by(() => {
-    const by = new Map<string, Seen>();
-    for (const e of seen) {
-      if (isSvc(e.from) || !isSvc(e.to)) continue;
-      const s = by.get(e.to.name) ?? { from: '', to: e.to.name, n: 0, what: [] };
-      s.n += e.connections;
-      s.what.push(endName(e.from));
-      by.set(e.to.name, s);
-    }
-    return [...by.values()];
-  });
-  // Wider for more connections, up to about four times as wide.
-  const width = (n: number) => 1.4 + Math.min(3.6, Math.log2(n + 1));
-  const conns = (n: number) => tn('1 connection', '{n} connections', n);
-  function endName(e: ConnectionEnd) {
-    switch (e.kind) {
-      case 'service':
-        return e.name;
-      case 'job':
-        return t('Job {name}', { name: e.name });
-      case 'node':
-        return t('node {name}', { name: e.name });
-      case 'namespace':
-        return t('other namespaces');
-      default:
-        return t('outside');
-    }
-  }
-  const viaNote = (e: ConnectionEdge) =>
-    e.via === 'service'
-      ? t('to its service address')
-      : e.via === 'published'
-        ? t('to a published port')
-        : t('to the task');
+  // What the nodes saw: between two services, and into each from anything
+  // but another of them.
+  const seenSummed = $derived(seenSummary(seen, (s) => svcRow.has(s)));
+  const seenBetween = $derived(seenSummed.between);
+  const seenIn = $derived(seenSummed.into);
 
   // All may reach all: one note rather than an arc each way between every
   // two of them, however many there are.
@@ -354,15 +304,7 @@
       return Math.max(ROW, n * TASK_STEP + 24);
     })
   );
-  const rowTops = $derived.by(() => {
-    const tops: number[] = [];
-    let top = HEADER_H;
-    for (const h of rowHeights) {
-      tops.push(top);
-      top += h;
-    }
-    return tops;
-  });
+  const rowTops = $derived(tops(rowHeights));
 
   const y = (row: number) => (rowTops[row] ?? HEADER_H + row * ROW) + (rowHeights[row] ?? ROW) / 2;
   const taskY = (row: number, ti: number, n: number) => y(row) + (ti - (n - 1) / 2) * TASK_STEP;
@@ -375,7 +317,6 @@
     return [...names].sort();
   });
   const multiNode = $derived(nodeNames.length > 1);
-  const NODE_HUES = 6;
   const nodeHue = (name: string) => {
     const i = nodeNames.indexOf(name);
     return i < 0 ? '' : `n${i % NODE_HUES}`;
@@ -410,49 +351,10 @@
     const r = (e.currentTarget as Element).getBoundingClientRect();
     menu = { x: r.left + Math.min(r.width, 40), y: r.top + r.height / 2, items: items(), label };
   }
-  const nodeHealth = (name: string) => {
-    const st = nodeOf(name)?.status?.state;
-    if (st === 'ready') return 'good';
-    if (st === 'down') return 'bad';
-    return st ? 'wait' : '';
-  };
-  const nodeNote = (name: string) => {
-    const n = nodeOf(name);
-    if (!n) return '';
-    const parts = [n.spec?.role ?? 'worker', n.status?.state ?? 'unknown'];
-    const av = n.spec?.availability;
-    if (av && av !== 'active') parts.push(av);
-    return parts.join(' · ');
-  };
 
   // Node bands, in the pods' column: each node's pods, then those not
   // placed on one yet.
-  const BAND_HEAD = 28;
-  const BAND_PAD = 10;
-  const BAND_GAP = 14;
-  const BAND_X = X_TASK - 12;
-  const BAND_W = TASK_W + 24;
-  type Band = { node: string; tasks: LObject[]; top: number; h: number };
-  const bands: Band[] = $derived.by(() => {
-    if (!byNode) return [];
-    const shown = activeTasks
-      .filter((tk) => svcRow.has(tk.spec?.service))
-      .sort(
-        (a, b) =>
-          svcRow.get(a.spec.service)! - svcRow.get(b.spec.service)! ||
-          a.metadata.name.localeCompare(b.metadata.name)
-      );
-    const groups = nodeNames.map((node) => ({ node, tasks: shown.filter((tk) => tk.spec?.node === node) }));
-    const unplaced = shown.filter((tk) => !tk.spec?.node);
-    if (unplaced.length) groups.push({ node: '', tasks: unplaced });
-    let top = HEADER_H;
-    return groups.map((g) => {
-      const h = BAND_HEAD + Math.max(1, g.tasks.length) * TASK_STEP + BAND_PAD;
-      const band = { ...g, top, h };
-      top += h + BAND_GAP;
-      return band;
-    });
-  });
+  const bands: Band[] = $derived(byNode ? nodeBands(activeTasks, nodeNames, svcRow) : []);
   // Where each pod is drawn: beside its service, or in its node's band.
   const taskPos = $derived.by(() => {
     const at = new Map<string, number>();
@@ -510,37 +412,10 @@
       });
     })
   );
-  const isVmSvc = (s: LObject) =>
-    Boolean((s.spec?.pod?.containers ?? []).some((c: { vm?: unknown }) => c.vm));
-  const isDbSvc = (s: LObject) =>
-    /postgres|mysql|maria|redis|mongo|sqlite|db/i.test(
-      `${s.metadata.name} ${s.spec?.pod?.containers?.[0]?.image ?? ''}`
-    );
-  const svcPorts = (s: LObject) => {
-    const list: number[] = [];
-    for (const c of s.spec?.pod?.containers ?? []) {
-      for (const p of c.ports ?? []) {
-        if (p.containerPort) list.push(p.containerPort);
-      }
-    }
-    return list;
-  };
-  const taskHealth = (tk: LObject) => {
-    const st = tk.status?.state;
-    if (st === 'running') return 'good';
-    if (st === 'failed' || st === 'rejected') return 'bad';
-    return 'wait';
-  };
   const arc = (from: number, to: number) => {
     const x = X_SVC_CX + SVC_R;
     const bulge = Math.min(110, 34 + Math.abs(to - from) * 24);
     return `M ${x} ${y(from) - 8} C ${x + bulge} ${y(from) - 8}, ${x + bulge} ${y(to) + 8}, ${x + 8} ${y(to) + 8}`;
-  };
-  const health = (s: LObject) => {
-    const st = s.status;
-    if (!st) return 'wait';
-    if ((st.desired ?? 0) === 0) return 'idle';
-    return (st.ready ?? 0) >= st.desired ? 'good' : (st.ready ?? 0) === 0 ? 'bad' : 'wait';
   };
   const volumeHealth = (name: string) => {
     const v = volumes.find((v) => v.metadata.name === name);
@@ -555,20 +430,12 @@
     if (v.status?.lost) return t('lost');
     return v.status?.node ? t('Volume on {node}', { node: v.status.node }) : t('Volume');
   };
-  const svcNote = (s: LObject) =>
-    s.status
-      ? t('{ready}/{desired} ready', { ready: s.status.ready ?? 0, desired: s.status.desired ?? 0 })
-      : t('not yet placed');
-  // What a route, a published port and a task show on their second line,
-  // and so what their links are named by first.
-  const routeAddress = (r: LObject) => `${r.spec?.host ?? ''}${r.spec?.path && r.spec.path !== '/' ? r.spec.path : ''}`;
-  const portShown = (p: Published) => `${p.at === null ? p.what : `:${p.at}`} → ${p.what.split('/')[0]}`;
+  // What a task shows on its second line, and so what its link is named
+  // by first.
   const taskLine = (tk: LObject) =>
-    `${isVmSvc(tk) ? 'bhyve' : 'jail'} · ${tk.status?.paused ? 'paused' : (tk.status?.ip ?? tk.status?.state ?? '')}${
+    `${isVm(tk) ? 'bhyve' : 'jail'} · ${tk.status?.paused ? 'paused' : (tk.status?.ip ?? tk.status?.state ?? '')}${
       byNode ? '' : ` · ${tk.spec?.node ?? ''}`
     }`;
-  const ports = (e: ReachEdge) =>
-    e.all_ports ? t('all ports') : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', ');
   const link = (kind: string, name: string) => `/k/${kind}/${namespace}/${name}`;
 
   // The service picked for the panel, ringed; until one is, the panel
@@ -576,37 +443,6 @@
   const picked = $derived(services.some((s) => s.metadata.name === selectedService) ? selectedService : '');
   const inspectedSvc = $derived(
     services.find((s) => s.metadata.name === selectedService) ?? services[0] ?? null
-  );
-  const inboundEdges = $derived(
-    inspectedSvc ? edges.filter((e) => e.to === inspectedSvc.metadata.name) : []
-  );
-  const outboundEdges = $derived(
-    inspectedSvc ? edges.filter((e) => e.from === inspectedSvc.metadata.name) : []
-  );
-  const seenInbound = $derived(
-    inspectedSvc ? seen.filter((e) => e.to.kind === 'service' && e.to.name === inspectedSvc.metadata.name) : []
-  );
-  const seenOutbound = $derived(
-    inspectedSvc
-      ? seen.filter(
-          (e) =>
-            e.from.kind === 'service' &&
-            e.from.name === inspectedSvc.metadata.name &&
-            !(e.to.kind === 'service' && e.to.name === inspectedSvc.metadata.name)
-        )
-      : []
-  );
-  const svcVips = $derived(
-    inspectedSvc ? balancers.filter((b) => b.service === inspectedSvc.metadata.name) : []
-  );
-  const svcRoutes = $derived(
-    inspectedSvc ? shownRoutes.filter((r) => r.spec?.service === inspectedSvc.metadata.name) : []
-  );
-  const svcPublished = $derived(
-    inspectedSvc ? published.filter((p) => p.service === inspectedSvc.metadata.name) : []
-  );
-  const svcVols = $derived(
-    inspectedSvc ? used.filter((u) => u.service === inspectedSvc.metadata.name).map((u) => u.volume) : []
   );
 </script>
 
@@ -742,7 +578,7 @@
 
           <!-- Node bands, behind their pods; a band opens its node. -->
           {#snippet band(b: Band)}
-            {@const nh = nodeHealth(b.node)}
+            {@const nh = nodeHealth(nodeOf(b.node))}
             <rect class="band {nh}" class:unplaced={!b.node} x={BAND_X} y={b.top} width={BAND_W} height={b.h} rx="10" />
             {#if b.node}
               <!-- Its node's colour, as on its pods grouped by service. -->
@@ -752,11 +588,11 @@
                  its link's name holds (WCAG 2.5.3). -->
             <text
               ><tspan class="band-title" x={BAND_X + (b.node ? 26 : 12)} y={b.top + 18}>{b.node || t('not placed yet')}</tspan
-              >{#if nodeNote(b.node)}{' '}<tspan
+              >{#if nodeNote(nodeOf(b.node))}{' '}<tspan
                   class="sub band-note {nh}"
                   x={BAND_X + BAND_W - 12}
                   y={b.top + 18}
-                  text-anchor="end">{nodeNote(b.node)}</tspan
+                  text-anchor="end">{nodeNote(nodeOf(b.node))}</tspan
                 >{/if}{#if !b.tasks.length}{' '}<tspan class="sub" x={X_TASK + 4} y={b.top + BAND_HEAD + TASK_STEP / 2 + 4}
                   >{t('no pods of this namespace')}</tspan
                 >{/if}</text
@@ -771,7 +607,7 @@
                 oncontextmenu={(e) => openMenu(e, nodeMenu(nodeOf(b.node), b.node, scene), t('Node {name}', { name: b.node }))}
                 onkeydown={(e) => menuKey(e, () => nodeMenu(nodeOf(b.node), b.node, scene), t('Node {name}', { name: b.node }))}
                 aria-label={t('Node {shown}, {pods}', {
-                  shown: [b.node, nodeNote(b.node), b.tasks.length ? '' : t('no pods of this namespace')]
+                  shown: [b.node, nodeNote(nodeOf(b.node)), b.tasks.length ? '' : t('no pods of this namespace')]
                     .filter((x) => x)
                     .join(' '),
                   pods: tn('1 pod', '{n} pods', b.tasks.length)
@@ -900,7 +736,7 @@
           <!-- Published ports: a plug icon, the port and where it is answered. -->
           {#each published as p, i (`${p.service}>${p.what}`)}
             {@const py = y(shownRoutes.length + i)}
-            {@const where = p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
+            {@const where = portWhere(p)}
             <a
               href={link('Service', p.service)}
               oncontextmenu={(e) => openMenu(e, portMenu(p, scene), t('Port {shown}', { shown: portShown(p) }))}
@@ -932,11 +768,8 @@
           <!-- OpenShift-style Circular Service Nodes with Pod Ring & Workload Icon -->
           {#each services as s, i (s.metadata.name)}
             {@const cy = y(i)}
-            {@const h = health(s)}
-            {@const vm = isVmSvc(s)}
-            {@const db = isDbSvc(s)}
-            {@const logo = logoFor(`${s.metadata.name} ${s.spec?.pod?.containers?.[0]?.image ?? ''}`)}
-            {@const pList = svcPorts(s)}
+            {@const h = serviceHealth(s)}
+            {@const pList = containerPorts(s)}
             <a
               href={link('Service', s.metadata.name)}
               data-drag="Service"
@@ -958,31 +791,7 @@
               <circle class="svc-ring {h}" cx={X_SVC_CX} cy={cy} r={SVC_R} />
               <circle class="svc-core" cx={X_SVC_CX} cy={cy} r={SVC_R - 6} />
 
-              {#if vm}
-                <!-- bhyve VM monitor icon -->
-                <rect x={X_SVC_CX - 10} y={cy - 9} width="20" height="14" rx="2" class="icon-stroke" />
-                <line x1={X_SVC_CX - 5} y1={cy + 9} x2={X_SVC_CX + 5} y2={cy + 9} class="icon-stroke" />
-                <line x1={X_SVC_CX} y1={cy + 5} x2={X_SVC_CX} y2={cy + 9} class="icon-stroke" />
-              {:else if logo}
-                <!-- What it runs, by its product's mark. -->
-                <path
-                  class="logo"
-                  style:fill="light-dark({logo.light}, {logo.dark})"
-                  d={logo.path}
-                  transform="translate({X_SVC_CX - 11} {cy - 11}) scale({22 / 24})"
-                aria-hidden="true"
-              ></path>
-              {:else if db}
-                <!-- Database cylinder icon -->
-                <ellipse cx={X_SVC_CX} cy={cy - 7} rx="9" ry="3.5" class="icon-stroke" />
-                <path d="M {X_SVC_CX - 9} {cy - 7} v 14 c 0 2 4 3.5 9 3.5 s 9 -1.5 9 -3.5 v -14" class="icon-stroke" />
-                <path d="M {X_SVC_CX - 9} {cy} c 0 2 4 3.5 9 3.5 s 9 -1.5 9 -3.5" class="icon-stroke" />
-              {:else}
-                <!-- FreeBSD Jail cube/pod icon -->
-                <polygon points="{X_SVC_CX},{cy - 11} {X_SVC_CX + 10},{cy - 5} {X_SVC_CX + 10},{cy + 6} {X_SVC_CX},{cy + 12} {X_SVC_CX - 10},{cy + 6} {X_SVC_CX - 10},{cy - 5}" class="icon-stroke" />
-                <polyline points="{X_SVC_CX - 10},{cy - 5} {X_SVC_CX},{cy + 1} {X_SVC_CX + 10},{cy - 5}" class="icon-stroke" />
-                <line x1={X_SVC_CX} y1={cy + 1} x2={X_SVC_CX} y2={cy + 12} class="icon-stroke" />
-              {/if}
+              <TopologyServiceIcon service={s} x={X_SVC_CX} y={cy} />
 
               <!-- Its health as a lamp; the count is said once, under its
                    name, so what is shown is what its link is named
@@ -1002,7 +811,6 @@
           {#each shownTasks as tk (tk.metadata.name)}
             {@const ty = taskPos.get(tk.metadata.name)!}
             {@const th = taskHealth(tk)}
-            {@const vm = isVmSvc(tk)}
             {@const node = tk.spec?.node ?? ''}
             <a
               href={link('Task', tk.metadata.name)}
@@ -1076,99 +884,16 @@
     </div>
 
     {#if inspectedSvc}
-      <aside class="card pf-inspector" aria-label={t('Packet filter inspector')}>
-        <h2>
-          <a href={link('Service', inspectedSvc.metadata.name)}>{inspectedSvc.metadata.name}</a>
-        </h2>
-        <p class="muted">{svcNote(inspectedSvc)}</p>
-
-        <h3>{t('Inbound PF allow rules')}</h3>
-        {#if inboundEdges.length}
-          <ul class="plain mono">
-            {#each inboundEdges as e (`${e.from}->${e.to}`)}
-              <li>← {e.from || t('other namespaces')}: {ports(e)}</li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="muted">{t('Isolated: no inbound peers allowed.')}</p>
-        {/if}
-
-        <h3>{t('Outbound PF allow rules')}</h3>
-        {#if outboundEdges.length}
-          <ul class="plain mono">
-            {#each outboundEdges as e (`${e.from}->${e.to}`)}
-              <li>→ {e.to}: {ports(e)}</li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="muted">{t('No intra-namespace outbound edges.')}</p>
-        {/if}
-
-        <h3>{t('Connections seen')}</h3>
-        {#if seenInbound.length || seenOutbound.length}
-          <ul class="plain mono">
-            {#each seenInbound as e (`${e.from.kind}:${e.from.name}>${e.port}/${e.protocol}/${e.via}`)}
-              <li>
-                ← {endName(e.from)}{e.from.kind === 'outside' && e.clients > 1 ? ` (${t('{n} clients', { n: e.clients })})` : ''}: {e.port}/{e.protocol}
-                <span class="muted">{viaNote(e)} · {conns(e.connections)}</span>
-              </li>
-            {/each}
-            {#each seenOutbound as e (`${e.to.kind}:${e.to.name}>${e.port}/${e.protocol}/${e.via}`)}
-              <li>
-                → {endName(e.to)}: {e.port}/{e.protocol}
-                <span class="muted">{viaNote(e)} · {conns(e.connections)}</span>
-              </li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="muted">{t('None in the last minute and a half.')}</p>
-        {/if}
-
-        {#if svcVips.length}
-          <h3>{t('CARP VIPs')}</h3>
-          <ul class="plain mono">
-            {#each svcVips as b (b.address)}
-              <li>{b.address} (vhid {b.vhid})</li>
-            {/each}
-          </ul>
-        {/if}
-
-        {#if svcPublished.length}
-          <h3>{t('Published ports')}</h3>
-          <ul class="plain mono">
-            {#each svcPublished as p (p.what)}
-              <li>
-                {p.at === null ? '—' : p.at} → {p.what}
-                <span class="muted">
-                  {p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
-                </span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-
-        {#if svcRoutes.length}
-          <h3>{t('Ingress Routes')}</h3>
-          <ul class="plain">
-            {#each svcRoutes as r (r.metadata.name)}
-              <li>
-                <a href={link('Route', r.metadata.name)}>
-                  {r.spec?.host ?? ''}{r.spec?.path ?? '/'}
-                </a>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-
-        {#if svcVols.length}
-          <h3>{t('Mounted Volumes')}</h3>
-          <ul class="plain">
-            {#each svcVols as v (v)}
-              <li><a href={link('Volume', v)}>{v}</a></li>
-            {/each}
-          </ul>
-        {/if}
-      </aside>
+      <TopologyInspector
+        service={inspectedSvc}
+        {namespace}
+        {edges}
+        {seen}
+        {balancers}
+        routes={shownRoutes}
+        {published}
+        {used}
+      />
     {/if}
   </div>
 {:else if !error}
@@ -1206,19 +931,6 @@
     .topo-layout {
       grid-template-columns: 1fr;
     }
-  }
-  /* The name and how ready it is read as one heading. */
-  .pf-inspector h2 {
-    margin-bottom: 0.1rem;
-  }
-  .pf-inspector h2 + p {
-    margin-top: 0;
-  }
-  .pf-inspector {
-    border-right: 1px solid var(--line);
-    background: var(--panel);
-    height: auto;
-    overflow: visible;
   }
   .topo-canvas {
     margin-top: 0.75rem;
@@ -1281,9 +993,6 @@
     stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
-  }
-  .logo {
-    fill: var(--text);
   }
   .badge-pill {
     fill: var(--surface2);
