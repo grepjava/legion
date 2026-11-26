@@ -314,6 +314,20 @@ impl Link {
     }
 }
 
+/// What a call that ended in `result` after `took` says of the link, for
+/// [`Link::after`]: its time if it got there and back, `None` if it ran out
+/// of time; nothing at all if it failed at once.
+fn learnt<T, E, O>(
+    result: &Result<Result<T, E>, O>,
+    took: std::time::Duration,
+) -> Option<Option<std::time::Duration>> {
+    match result {
+        Ok(Ok(_)) => Some(Some(took)),
+        Ok(Err(_)) => None,
+        Err(_) => Some(None),
+    }
+}
+
 /// The length of `value` encoded, without keeping it.
 fn encoded_len<T: Serialize>(value: &T) -> usize {
     struct Count(usize);
@@ -388,11 +402,17 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         let result =
             tokio::time::timeout_at(start + allowed, self.send(Method::Append, json, &option))
                 .await;
-        let took = result.is_ok().then(|| start.elapsed());
-        self.budgets
-            .lock()
-            .unwrap()
-            .insert(self.target, link.after(size, took, allowed));
+        // What a call says of the link: its time, if it got there and back,
+        // or that it ran out of time. One that failed at once (refused,
+        // reset) says neither: taken for a round trip, its millisecond
+        // would hold the link's for good (found by an audit).
+        let learnt = learnt(&result, start.elapsed());
+        if let Some(took) = learnt {
+            self.budgets
+                .lock()
+                .unwrap()
+                .insert(self.target, link.after(size, took, allowed));
+        }
         match result {
             Ok(result) => result.map(partly),
             Err(_) => Err(RPCError::PayloadTooLarge(
@@ -590,8 +610,22 @@ pub(crate) async fn read_index(
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_BUDGET, Link, MAX_BATCH, MIN_BUDGET, encoded_len, fitting};
+    use super::{FIRST_BUDGET, Link, MAX_BATCH, MIN_BUDGET, encoded_len, fitting, learnt};
     use std::time::Duration;
+
+    /// Found by an audit: a call refused at once was taken for a round
+    /// trip of a millisecond, which then held the link's round trip for
+    /// good. Only a call that got there and back is timed.
+    #[test]
+    fn only_a_call_that_got_there_and_back_is_timed() {
+        let ms = Duration::from_millis;
+        let ok: Result<Result<(), ()>, ()> = Ok(Ok(()));
+        let failed: Result<Result<(), ()>, ()> = Ok(Err(()));
+        let out: Result<Result<(), ()>, ()> = Err(());
+        assert_eq!(learnt(&ok, ms(240)), Some(Some(ms(240))));
+        assert_eq!(learnt(&failed, ms(1)), None);
+        assert_eq!(learnt(&out, ms(800)), Some(None));
+    }
 
     #[test]
     fn a_call_carries_the_leading_entries_that_fit() {
