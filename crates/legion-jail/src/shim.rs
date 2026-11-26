@@ -153,6 +153,53 @@ mod tests {
     use super::{Fence, FenceStep};
     use std::time::{Duration, Instant};
 
+    /// A terminal whose output nobody reads: the drain gives up after its
+    /// time, not never (it did, `signal(3)` restarting it on FreeBSD). In
+    /// a child of its own: the alarm goes to the process, which the shim
+    /// is alone in, and the tests are not.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn a_drain_nobody_reads_gives_up_in_time() {
+        // SAFETY: a forked child runs only async-signal-safe calls and
+        // exits; the parent waits for it.
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                if m < 0 || libc::grantpt(m) != 0 || libc::unlockpt(m) != 0 {
+                    libc::_exit(2);
+                }
+                let mut name = [0 as libc::c_char; 64];
+                if libc::ptsname_r(m, name.as_mut_ptr(), name.len()) != 0 {
+                    libc::_exit(3);
+                }
+                let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                let out = [b'x'; 512];
+                if s < 0 || libc::write(s, out.as_ptr().cast(), out.len()) <= 0 {
+                    libc::_exit(4);
+                }
+                super::imp::drain_for(s, 1);
+                libc::_exit(0);
+            }
+            let began = std::time::Instant::now();
+            let mut status = 0;
+            while libc::waitpid(child, &mut status, libc::WNOHANG) == 0 {
+                if began.elapsed() > std::time::Duration::from_secs(10) {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                    panic!("the drain still waits after 10 s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "{status}"
+            );
+            assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
     #[test]
     fn a_fenced_container_stops_once_its_lease_runs_out_then_is_killed() {
         let dir = tempfile::tempdir().unwrap();
@@ -585,7 +632,6 @@ mod imp {
     /// a reader gone takes nothing), and exits as the command did, a signal
     /// as a shell gives it (128 and the signal).
     fn run_and_drain(prepared: &Prepared, name: &str) -> i32 {
-        extern "C" fn wake(_: libc::c_int) {}
         const TERMINAL: [libc::c_int; 3] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP];
         // SAFETY: plain system calls; this process is single-threaded, so
         // the child may run anything before its exec.
@@ -614,10 +660,7 @@ mod imp {
                     return 1;
                 }
             }
-            libc::signal(libc::SIGALRM, wake as *const () as libc::sighandler_t);
-            libc::alarm(5);
-            libc::tcdrain(1);
-            libc::alarm(0);
+            drain_for(1, 5);
             if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {
@@ -625,6 +668,27 @@ mod imp {
             } else {
                 1
             }
+        }
+    }
+
+    /// Waits until what was written to the terminal `fd` is read, for at
+    /// most `secs`: an alarm breaks the wait off. Not as `signal(3)` sets
+    /// it, which on FreeBSD restarts what the signal broke off
+    /// (`SA_RESTART`), so `tcdrain` went on waiting for ever for a reader
+    /// that had gone, the shim stuck and its terminal with it (found by an
+    /// audit).
+    pub(super) fn drain_for(fd: libc::c_int, secs: u32) {
+        extern "C" fn wake(_: libc::c_int) {}
+        // SAFETY: plain system calls on a zeroed `sigaction` filled in.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = wake as *const () as libc::sighandler_t;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
+            libc::alarm(secs);
+            libc::tcdrain(fd);
+            libc::alarm(0);
         }
     }
 

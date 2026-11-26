@@ -318,6 +318,13 @@ members are told their role only on nodes that read it.
   witnesses would remain (they never stand: the cluster would have no
   leader for good); removals go one at a time, so two cannot each leave
   the other's the last (found by an audit).
+- `legion exec -t` (and the console's shell) could leave its shim stuck
+  for good when the client went away after output: the 5 s limit on
+  waiting for the terminal's output to be read never fired, as FreeBSD's
+  `signal(3)` restarts the wait the alarm breaks off; the session and its
+  terminal stayed with it. Terminals opened at once for several sessions
+  no longer share one buffer for their names (`ptsname`). Both found by
+  an audit.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

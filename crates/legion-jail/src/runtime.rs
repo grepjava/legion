@@ -2306,10 +2306,29 @@ fn pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
         if libc::grantpt(m) != 0 || libc::unlockpt(m) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let name = libc::ptsname(m);
-        if name.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
+        // Its name in a buffer of this call's own: `ptsname` returns one
+        // shared by every thread, and terminals open at once for several
+        // sessions could take each other's (found by an audit).
+        #[cfg(not(target_vendor = "apple"))]
+        let name = {
+            let mut name = [0 as libc::c_char; 64];
+            let r = libc::ptsname_r(m, name.as_mut_ptr(), name.len());
+            if r != 0 {
+                return Err(std::io::Error::from_raw_os_error(r));
+            }
+            name
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let name = name.as_ptr();
+        // macOS has no `ptsname_r`; it runs no containers either.
+        #[cfg(target_vendor = "apple")]
+        let name = {
+            let name = libc::ptsname(m);
+            if name.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            name
+        };
         let s = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
         if s < 0 {
             return Err(std::io::Error::last_os_error());
@@ -2381,7 +2400,12 @@ fn sqlite_failed(stderr: &str) -> bool {
 
 impl JailRuntime {
     /// `exec`, with `input` as the command's standard input if given.
-    async fn exec_with(&self, id: &str, cmd: &[String], input: Option<&[u8]>) -> Result<ExecOutput> {
+    async fn exec_with(
+        &self,
+        id: &str,
+        cmd: &[String],
+        input: Option<&[u8]>,
+    ) -> Result<ExecOutput> {
         let (_, jid) = self.running_jid(id)?;
         let dir = self.container_dir(id);
         let mut args: Vec<OsString> = vec![
