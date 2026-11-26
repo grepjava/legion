@@ -1069,6 +1069,19 @@ impl<H: Host> Pg<'_, H> {
             }
             action = "cloned";
         } else {
+            // A copy cut short (its process killed, its node down) leaves
+            // files but no control file: what is there is no database to
+            // rewind, but one to copy again, as `reclone` allows (found by
+            // an audit: it failed plainly, for good).
+            if !self.data.join("global/pg_control").exists() {
+                return Err(Fail::code(
+                    spi::DIVERGED,
+                    format!(
+                        "{} holds a database cut short (no global/pg_control): its copy did not finish",
+                        self.data.display()
+                    ),
+                ));
+            }
             let local = self.controldata()?;
             let (system, timeline) = self.identify(&p, &pw)?;
             if local.system != system {
@@ -1257,7 +1270,13 @@ impl<H: Host> Pg<'_, H> {
                     "named primary but not promoted: promote it first",
                 ));
             }
+            // Its settings as the Service's now (allowed clients, what WAL
+            // it keeps, archiving), reloaded, as a replica's are: they
+            // waited for a restart (found by an audit). `archive_mode`
+            // itself still does.
+            self.configure_files(None)?;
             self.configure_primary()?;
+            self.psql("SELECT pg_reload_conf()")?;
         } else if !recovery {
             return Err(Fail::code(
                 spi::RESTART,

@@ -226,6 +226,8 @@ fn a_crashed_primary_finishes_recovery_with_the_settings_it_ran_with_before_pg_r
         return;
     }
     std::fs::write(s.data.join("PG_VERSION"), "17").unwrap();
+    std::fs::create_dir_all(s.data.join("global")).unwrap();
+    std::fs::write(s.data.join("global/pg_control"), "").unwrap();
     let crashed = "Database system identifier:           7300000000000000001\n\
 Database cluster state:               in production\n\
 Latest checkpoint's TimeLineID:       1\n\
@@ -335,6 +337,8 @@ fn a_replica_is_copied_when_empty_rewound_when_it_ran_as_primary_and_refused_ano
 
     // An old primary: rewound.
     std::fs::write(s.data.join("PG_VERSION"), "17\n").unwrap();
+    std::fs::create_dir_all(s.data.join("global")).unwrap();
+    std::fs::write(s.data.join("global/pg_control"), "").unwrap();
     let mut h = Fake::default();
     h.on("pg_controldata", true, CONTROL, "");
     h.on(
@@ -457,6 +461,11 @@ fn configure_keeps_slots_for_the_members_and_sets_the_quorum() {
         "an active slot stays"
     );
     assert!(h.ran("ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (\"pg-1\", \"pg-2\")'"));
+    // Its settings rewritten as the Service's now, and reloaded.
+    let conf = std::fs::read_to_string(s.data.join(CONF)).unwrap();
+    assert!(conf.contains("wal_level = replica"), "{conf}");
+    assert!(!conf.contains("primary_conninfo"), "{conf}");
+    assert!(h.ran("pg_reload_conf"));
 
     // A primary told another one leads: start again as a replica.
     let mut h = Fake::default();
@@ -546,6 +555,8 @@ fn a_replica_allowed_to_reclone_discards_its_data_and_copies_the_primary() {
         return;
     }
     std::fs::write(s.data.join("PG_VERSION"), "17\n").unwrap();
+    std::fs::create_dir_all(s.data.join("global")).unwrap();
+    std::fs::write(s.data.join("global/pg_control"), "").unwrap();
     std::fs::create_dir(s.data.join("base")).unwrap();
     std::fs::write(s.data.join("base").join("1"), "old").unwrap();
     let mut req: Request =
@@ -778,6 +789,8 @@ fn a_rewind_waits_until_what_was_archived_is_shipped() {
     let spool = spool_dir(&s.data);
     // An old primary: one segment archived, one finished but not.
     std::fs::write(s.data.join("PG_VERSION"), "18\n").unwrap();
+    std::fs::create_dir_all(s.data.join("global")).unwrap();
+    std::fs::write(s.data.join("global/pg_control"), "").unwrap();
     std::fs::create_dir(&spool).unwrap();
     std::fs::write(spool.join("000000040000000000000004"), "four").unwrap();
     std::fs::write(spool.join("000000040000000000000006.part"), "").unwrap();
@@ -826,6 +839,8 @@ fn without_archiving_a_rewind_does_not_wait_on_a_spool() {
         return;
     }
     std::fs::write(s.data.join("PG_VERSION"), "18\n").unwrap();
+    std::fs::create_dir_all(s.data.join("global")).unwrap();
+    std::fs::write(s.data.join("global/pg_control"), "").unwrap();
     std::fs::create_dir(spool_dir(&s.data)).unwrap();
     std::fs::write(spool_dir(&s.data).join("000000010000000000000001"), "").unwrap();
     let mut h = Fake::default();
@@ -839,4 +854,36 @@ fn without_archiving_a_rewind_does_not_wait_on_a_spool() {
     h.on("pg_rewind", true, "", "pg_rewind: Done!");
     let req = request(&s, 1, Some(0), Some(Role::Replica));
     assert!(handle("prepare", &req, &mut h).unwrap().contains("rewound"));
+}
+
+/// Found by an audit: a copy cut short (its process killed after
+/// PG_VERSION was written) failed plainly, for good, though `reclone` was
+/// allowed. It is a database cut short: diverged, which `reclone` copies
+/// again.
+#[test]
+fn a_copy_cut_short_is_copied_again() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    std::fs::write(
+        s.data.join("PG_VERSION"),
+        "18
+",
+    )
+    .unwrap();
+    std::fs::create_dir(s.data.join("base")).unwrap();
+    let req = request(&s, 1, Some(0), Some(Role::Replica));
+    let mut h = Fake::default();
+    h.on(
+        "IDENTIFY_SYSTEM",
+        true,
+        "7300000000000000001|2|0/5000000|
+",
+        "",
+    );
+    let e = handle("prepare", &req, &mut h).unwrap_err();
+    assert_eq!(e.code, spi::DIVERGED, "{}", e.message);
+    assert!(e.message.contains("cut short"), "{}", e.message);
+    assert!(!h.ran("pg_rewind"));
 }
