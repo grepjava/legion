@@ -417,7 +417,10 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                             });
                     let attempt = copy(0, e.clone());
                     update(store, &key, |s| match &mut s.replica {
-                        Some(now) if now.node == taken.node => {
+                        // Of a copy from where the data still is, as a copy
+                        // in is (found by an audit: one from a holder the
+                        // data has left was written down too).
+                        Some(now) if now.node == taken.node && s.node == taken.from => {
                             now.message = why.clone();
                             // Stale stays stale: only a copy makes it
                             // fresh again (ReplicaStatus::settled).

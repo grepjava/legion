@@ -86,11 +86,14 @@ fn ready_nodes(store: &Store) -> Option<HashSet<String>> {
     )
 }
 
+/// A schedule's run: the Volume, the schedule, the snapshot, when, the
+/// node it ran on, and how many it kept.
 type Taken = (
     ObjectKey,
     SnapshotSchedule,
     String,
     i64,
+    String,
     Result<u32, String>,
 );
 
@@ -101,11 +104,16 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
     let mut tried: HashMap<(ObjectKey, legion_api::quantity::Duration), i64> = HashMap::new();
     loop {
         while let Some(done) = runs.try_join_next() {
-            let Ok((key, schedule, name, at_ms, result)) = done else {
+            let Ok((key, schedule, name, at_ms, node, result)) = done else {
                 continue;
             };
             running.remove(&(key.clone(), schedule.every));
             let r = update(store, &key, |s| {
+                // Moved meanwhile: what it took is of a copy that is no
+                // longer the Volume's (found by an audit).
+                if s.node != node {
+                    return false;
+                }
                 let i = match s.snapshots.iter().position(|st| st.every == schedule.every) {
                     Some(i) => i,
                     None => {
@@ -197,7 +205,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                 );
                 runs.spawn(async move {
                     let result = take(&hub, &k, &node, &s, &name).await;
-                    (k, s, name, now, result)
+                    (k, s, name, now, node, result)
                 });
             }
         }

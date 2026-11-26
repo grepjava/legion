@@ -358,6 +358,11 @@ members are told their role only on nodes that read it.
   bound, so a pod flooding it could exhaust the node's agent; it answers
   256 UDP queries and serves 64 TCP connections at once at most, dropping
   queries past that (their clients ask again). Found by an audit.
+- A scheduled snapshot, or a replica's failed copy, that ended after its
+  Volume had moved was written into the Volume's status as if of where it
+  is now; it is left out (found by an audit). A move onto the node
+  receiving a replica's copy waits for that copy to end (the agent refuses
+  a second receive into the dataset) rather than destroy what it took.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion
