@@ -120,6 +120,49 @@ pub(crate) async fn run(
 }
 
 /// The name a build gives its image in the builder's store.
+/// The files a build reads straight from its context, not through COPY
+/// (which keeps to the context itself).
+const READ_FROM_CONTEXT: [&str; 4] = [
+    "Containerfile",
+    "Dockerfile",
+    ".containerignore",
+    ".dockerignore",
+];
+
+/// The build context `path` names in the repository cloned at `src`
+/// (empty: its top), resolved: it, and the files the build reads straight
+/// from it, must be in the clone. A repository is anyone's who may build:
+/// through a symbolic link (`path` -> `/`, or `Containerfile` ->
+/// `/etc/master.passwd`) the build would read this node's files and could
+/// put them in an image it pushes (seen in an audit). Links within the
+/// repository are kept.
+fn confined_context(src: &Path, path: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(src).map_err(|e| format!("the clone: {e}"))?;
+    let named = if path.is_empty() {
+        src.to_path_buf()
+    } else {
+        src.join(path)
+    };
+    let context =
+        std::fs::canonicalize(&named).map_err(|e| format!("source.git.path {path:?}: {e}"))?;
+    if !context.starts_with(&root) || !context.is_dir() {
+        return Err(format!(
+            "source.git.path {path:?} is not a directory in the repository"
+        ));
+    }
+    for name in READ_FROM_CONTEXT {
+        let file = context.join(name);
+        if std::fs::symlink_metadata(&file).is_err() {
+            continue;
+        }
+        let real = std::fs::canonicalize(&file).map_err(|e| format!("{name}: {e}"))?;
+        if !real.starts_with(&root) {
+            return Err(format!("{name} leads out of the repository"));
+        }
+    }
+    Ok(context)
+}
+
 fn tag(short: &str) -> String {
     format!("legion-build/{short}:1")
 }
@@ -174,11 +217,11 @@ async fn build(
             src.display().to_string(),
         ]);
         step("git clone", "git", &args, &[], tx, inbound).await?;
-        if opts.git_path.is_empty() {
-            src
-        } else {
-            src.join(&opts.git_path)
-        }
+        let path = opts.git_path.clone();
+        tokio::task::spawn_blocking(move || confined_context(&src, &path))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::invalid_argument)?
     };
     let mut env = Vec::new();
     if !opts.auth.is_empty() {
@@ -439,5 +482,40 @@ mod tests {
         forget(&stand_in(dir.path(), 1), &tag("def456"), false).await;
         let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         assert_eq!(args.lines().count(), 2, "{args}");
+    }
+
+    /// Seen in an audit: `source.git.path` was checked for `..` only, and a
+    /// repository's symbolic link made this node's root the build context.
+    /// The context and the files read straight from it stay in the clone.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_context_stays_in_the_repository() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        std::fs::create_dir_all(src.join("app/docker")).unwrap();
+        std::fs::write(src.join("app/docker/Dockerfile.prod"), "FROM x\n").unwrap();
+        symlink("docker/Dockerfile.prod", src.join("app/Containerfile")).unwrap();
+        let outside = dir.path().join("host");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        // The top, a directory, and one with a link within: kept.
+        let root = std::fs::canonicalize(&src).unwrap();
+        assert_eq!(confined_context(&src, "").unwrap(), root);
+        assert_eq!(confined_context(&src, "app").unwrap(), root.join("app"));
+        // The context a link out, or not a directory: refused.
+        symlink(&outside, src.join("out")).unwrap();
+        symlink("/", src.join("slash")).unwrap();
+        for p in ["out", "slash", "app/docker/Dockerfile.prod", "none"] {
+            assert!(confined_context(&src, p).is_err(), "{p}");
+        }
+        // A file read straight from the context, a link out: refused.
+        std::fs::create_dir(src.join("leaky")).unwrap();
+        symlink(outside.join("secret"), src.join("leaky/.dockerignore")).unwrap();
+        let e = confined_context(&src, "leaky").unwrap_err();
+        assert!(e.contains(".dockerignore"), "{e}");
+        std::fs::create_dir(src.join("dangling")).unwrap();
+        symlink("/nonexistent/x", src.join("dangling/Containerfile")).unwrap();
+        assert!(confined_context(&src, "dangling").is_err());
     }
 }

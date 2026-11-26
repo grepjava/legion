@@ -300,6 +300,14 @@ members are told their role only on nodes that read it.
   Volume's own chains (in ZFS's characters, every word quoted for the
   remote shell), files right in its own directory, and a Volume of the
   session's namespace.
+- **Security: a Build's repository could reach the builder node's files.**
+  `source.git.path` was checked for `..` only, so a symbolic link in the
+  repository (`path` -> `/`) made the node's root the build context, and
+  a `Containerfile` or `.dockerignore` linked out was read from the host
+  (found by an audit): anyone who may create Builds could copy node files
+  into an image and push it. The context, and the files a build reads
+  straight from it, must now resolve inside the clone; links within the
+  repository still work.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion
