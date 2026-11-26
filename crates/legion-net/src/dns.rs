@@ -667,7 +667,6 @@ mod tests {
     async fn queries_past_the_bound_are_dropped() {
         let up = upstream().await;
         let serving = |udp_queries, tcp_connections| {
-            let up = up;
             async move {
                 let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
