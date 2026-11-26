@@ -65,6 +65,16 @@ pub(crate) fn spool_in(
     ))
 }
 
+/// The spool every member has, as a member running says it: one not
+/// running (stopped, being prepared) says nothing, yet its spool may hold
+/// what it archived and was not shipped, which its plugin waits on before
+/// replacing its data (a rewound old primary). The path is the
+/// container's, the same for each member; its Volume is the member's own
+/// ([`spool_in`]).
+fn known_spool(st: &ReplicationStatus) -> Option<&str> {
+    st.members.values().find_map(|m| m.status.spool.as_deref())
+}
+
 type Done = (ObjectKey, String, String, i64, bool, Result<Ran, String>);
 
 pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
@@ -143,8 +153,9 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                 .and_then(|a| a.pruned_ms)
                 .is_none_or(|at| at + PRUNE_EVERY_MS <= now)
                 && !running.iter().any(|(k, _)| *k == key);
+            let known = known_spool(&st);
             for (member, m) in &st.members {
-                let Some(spool) = m.status.spool.as_deref() else {
+                let Some(spool) = m.status.spool.as_deref().or(known) else {
                     continue;
                 };
                 let id = (key.clone(), member.clone());
@@ -379,5 +390,29 @@ pod:
         assert_eq!(a.last, "000000010000000000000006");
         assert_eq!((a.failures, a.pending, a.pruned_ms), (0, 2, Some(40)));
         assert!(a.message.is_empty());
+    }
+
+    /// Seen in the lab: an old primary rewound to rejoin waits until what
+    /// it archived is shipped, but says no spool while it is not running;
+    /// the spool the others say is its too, in its own Volume.
+    #[test]
+    fn a_member_not_running_is_shipped_from_the_spool_the_others_say() {
+        let st: ReplicationStatus = serde_json::from_value(serde_json::json!({
+            "epoch": 2,
+            "phase": "degraded",
+            "members": {
+                "pg-0": { "at": 1, "healthy": false, "role": "unknown", "error": "status did not finish in time" },
+                "pg-1": { "at": 2, "healthy": true, "role": "primary", "spool": "/var/db/pg/data/legion_wal" },
+            }
+        }))
+        .unwrap();
+        assert_eq!(known_spool(&st), Some("/var/db/pg/data/legion_wal"));
+        let none: ReplicationStatus = serde_json::from_value(serde_json::json!({
+            "epoch": 1,
+            "phase": "forming",
+            "members": { "pg-0": { "at": 1, "healthy": false, "role": "unknown" } }
+        }))
+        .unwrap();
+        assert_eq!(known_spool(&none), None);
     }
 }
