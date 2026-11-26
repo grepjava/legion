@@ -47,6 +47,14 @@ pub enum Loosening {
     /// the host, as root and outside any jail, booting a disk image the
     /// namespace supplies.
     Vm,
+    /// A Volume the host mounts over NFS from a server the namespace names
+    /// (`driver: nfs`).
+    NfsVolumes,
+    /// A Volume the host mounts from an iSCSI LUN (`driver: iscsi`): the
+    /// host's kernel reads a filesystem the namespace may have written.
+    IscsiVolumes,
+    /// A Volume an operator's plugin makes (`driver: plugin`).
+    PluginVolumes,
 }
 
 impl From<Allow> for Loosening {
@@ -70,6 +78,23 @@ impl Loosening {
             Loosening::Securelevel => "securelevel",
             Loosening::EnforceStatfs => "enforceStatfs",
             Loosening::Vm => "vm",
+            Loosening::NfsVolumes => "nfsVolumes",
+            Loosening::IscsiVolumes => "iscsiVolumes",
+            Loosening::PluginVolumes => "pluginVolumes",
+        }
+    }
+
+    /// What a Volume of `driver` takes of its namespace: none for ZFS, a
+    /// dataset of the node's own; the host mounts the others (found by an
+    /// audit: any namespace's editors could have it mount a server, or a
+    /// filesystem image, of their choosing).
+    pub fn of_volume(driver: crate::volume::VolumeDriver) -> Option<Loosening> {
+        use crate::volume::VolumeDriver;
+        match driver {
+            VolumeDriver::Zfs => None,
+            VolumeDriver::Nfs => Some(Loosening::NfsVolumes),
+            VolumeDriver::Iscsi => Some(Loosening::IscsiVolumes),
+            VolumeDriver::Plugin => Some(Loosening::PluginVolumes),
         }
     }
 }

@@ -2364,6 +2364,11 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   level below 2, `enforceStatfs` for 1, and `vm` for a container that is
   a bhyve VM, 6.8: its hypervisor runs on the host, as root and outside
   any jail, so since 2026-11-23 no namespace runs one unless allowed).
+  A Volume the host mounts takes its namespace's leave the same way:
+  `nfsVolumes`, `iscsiVolumes` and `pluginVolumes` for those drivers
+  (the host would mount a server, or read a filesystem, the namespace
+  chose), mounted `nosuid` and never `-o suid`; a stack's namespace
+  allows the drivers its Volumes declare.
   Namespaces are cluster-scoped, so only the cluster admin decides. A Namespace tightened later holds for
   everything made from then on, from specs admitted earlier too: such a
   task waits Pending with the reason, one not yet started is stopped, and a

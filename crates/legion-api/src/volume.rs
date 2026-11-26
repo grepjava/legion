@@ -758,9 +758,10 @@ fn is_ipv6(s: &str) -> bool {
 }
 
 /// A `mount -o` word: no separators or spaces that would change the
-/// command.
+/// command, and not `suid` (the host mounts it `nosuid`).
 fn option_word(o: &str) -> bool {
     !o.is_empty()
+        && o != "suid"
         && o.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '=' | '_' | '-' | '.' | '/'))
 }

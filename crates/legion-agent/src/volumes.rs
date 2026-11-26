@@ -398,10 +398,12 @@ fn mount_nfs(sys: &dyn Sys, nfs: &NfsSource, dir: &Path) -> Result<String, Strin
     } else {
         nfs.server.clone()
     };
+    // Set-user-ID files on it are not honoured, as for every mount the
+    // namespace supplies.
     let options = if nfs.options.is_empty() {
-        "nfsv4".to_owned()
+        "nfsv4,nosuid".to_owned()
     } else {
-        nfs.options.join(",")
+        format!("{},nosuid", nfs.options.join(","))
     };
     let source = format!("{server}:{}", nfs.path);
     sys.mount_fs("nfs", &source, &path, &options)
@@ -490,7 +492,7 @@ fn mount_iscsi(
     // read-only at best: checked first, as boot checks its own.
     sys.fsck_preen(&device).map_err(e)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {path}: {e}"))?;
-    sys.mount_fs("ufs", &device, &path, "").map_err(e)?;
+    sys.mount_fs("ufs", &device, &path, "nosuid").map_err(e)?;
     Ok(path)
 }
 

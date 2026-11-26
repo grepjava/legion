@@ -3883,6 +3883,14 @@ async fn a_rejected_task_has_no_sessions() {
 async fn a_volume_in_use_keeps_its_storage() {
     let m = Running::start().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
+    // The host mounts these: the namespace must allow them.
+    apply_json(
+        &m,
+        "Namespace",
+        "default",
+        serde_json::json!({ "security": { "allow": ["nfsVolumes", "iscsiVolumes"] } }),
+    )
+    .await;
     let lun = |target: &str| {
         serde_json::json!({
             "driver": "iscsi",
@@ -4209,6 +4217,14 @@ async fn a_volume_changed_during_its_delete_is_checked_again() {
     use legion_api::{Kind, Object as Stored, ObjectKey};
     let m = Running::start().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
+    // The host mounts these: the namespace must allow them.
+    apply_json(
+        &m,
+        "Namespace",
+        "default",
+        serde_json::json!({ "security": { "allow": ["nfsVolumes", "iscsiVolumes"] } }),
+    )
+    .await;
     let lun = |target: &str| {
         serde_json::json!({
             "driver": "iscsi",
@@ -4282,6 +4298,14 @@ async fn a_volume_in_use_is_not_deleted() {
     use legion_api::{Kind, Object as Stored, ObjectKey};
     let m = Running::start().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
+    // The host mounts these: the namespace must allow them.
+    apply_json(
+        &m,
+        "Namespace",
+        "default",
+        serde_json::json!({ "security": { "allow": ["nfsVolumes", "iscsiVolumes"] } }),
+    )
+    .await;
     let objects = m.objects().await;
     let delete = |name: &str| {
         let mut objects = objects.clone();
@@ -4417,6 +4441,14 @@ async fn a_lun_two_volumes_name_is_held_by_one_node() {
     use legion_api::{Kind, Object as Stored, ObjectKey};
     let m = Running::start_steady().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
+    // The host mounts these: the namespace must allow them.
+    apply_json(
+        &m,
+        "Namespace",
+        "default",
+        serde_json::json!({ "security": { "allow": ["nfsVolumes", "iscsiVolumes"] } }),
+    )
+    .await;
     let d = DispatcherClient::new(m.channel(None).await.unwrap());
     for node in ["w1", "w2"] {
         let d = d.clone();
@@ -4453,7 +4485,12 @@ async fn a_lun_two_volumes_name_is_held_by_one_node() {
     let objects = m.objects().await;
     objects
         .clone()
-        .apply(object("Namespace", "", "other", serde_json::json!({})))
+        .apply(object(
+            "Namespace",
+            "",
+            "other",
+            serde_json::json!({ "security": { "allow": ["iscsiVolumes"] } }),
+        ))
         .await
         .unwrap();
     apply_json(&m, "Volume", "a", lun("192.0.2.5", "iqn.2026-11.test:shop")).await;
@@ -7548,4 +7585,45 @@ async fn inspecting_a_registrys_image_takes_reading_the_namespace() {
             .is_err_and(|e| e.code() != Code::PermissionDenied),
         "{r:?}"
     );
+}
+
+/// Found by an audit: any namespace's editors could have the host mount an
+/// NFS server or an iSCSI LUN of their choosing. Only where the namespace
+/// allows it (as the cluster admin sets), and never `suid`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_the_host_mounts_takes_its_namespaces_leave() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let objects = m.objects().await;
+    let volume = |name: &str, spec: serde_json::Value| {
+        let mut objects = objects.clone();
+        let req = object("Volume", "shop", name, spec);
+        async move { objects.apply(req).await }
+    };
+    let nfs =
+        serde_json::json!({ "driver": "nfs", "nfs": { "server": "files", "path": "/export" } });
+    let lun = serde_json::json!({
+        "driver": "iscsi",
+        "iscsi": { "portal": "192.0.2.5", "target": "iqn.2026-11.x:t", "lun": 0 },
+    });
+    // A ZFS Volume needs nothing of it.
+    eventually(|| volume("data", serde_json::json!({}))).await;
+    assert!(denied(volume("files", nfs.clone()).await).contains("nfsVolumes"));
+    assert!(denied(volume("disk", lun.clone()).await).contains("iscsiVolumes"));
+    apply_json(
+        &m,
+        "Namespace",
+        "shop",
+        serde_json::json!({ "security": { "allow": ["nfsVolumes"] } }),
+    )
+    .await;
+    eventually(|| volume("files", nfs.clone())).await;
+    assert!(denied(volume("disk", lun.clone()).await).contains("iscsiVolumes"));
+    // `suid` is not an option it takes.
+    let suid = serde_json::json!({
+        "driver": "nfs",
+        "nfs": { "server": "files", "path": "/export", "options": ["suid"] },
+    });
+    let e = volume("setuid", suid).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "{e}");
 }

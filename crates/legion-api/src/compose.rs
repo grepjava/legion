@@ -56,6 +56,15 @@ impl Stack {
                 }
             }
         }
+        // A Volume the host mounts, as the stack declares it.
+        for o in self.objects.iter().filter(|o| o.kind == Kind::Volume) {
+            let driver = serde_json::from_value(o.spec["driver"].clone()).unwrap_or_default();
+            if let Some(l) = crate::security::Loosening::of_volume(driver)
+                && !allow.iter().any(|x| x == l.as_str())
+            {
+                allow.push(l.as_str().to_owned());
+            }
+        }
         if allow.is_empty() {
             json!({})
         } else {

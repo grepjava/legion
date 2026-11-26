@@ -330,6 +330,16 @@ members are told their role only on nodes that read it.
   had the manager reach any registry named and learned what a namespace's
   ImagePolicy makes of the image. It now takes reading the namespace's
   Services (`default` unless `-n`). Found by an audit.
+- **Security, and an upgrade step:** a Volume the host mounts (`driver:
+  nfs`, `iscsi` or `plugin`) now takes its namespace's leave, as a VM
+  does: `spec.security.allow` on the Namespace lists `nfsVolumes`,
+  `iscsiVolumes` or `pluginVolumes`. Before, anyone who may edit a
+  namespace could have the host mount an NFS server, or read a UFS
+  filesystem from a LUN, of their choosing (found by an audit). NFS and
+  iSCSI Volumes are mounted `nosuid`, and `suid` is refused as an option.
+  Volumes made before keep working; to change one, or make another, the
+  cluster admin allows the driver first. A stack's namespace allows the
+  drivers its Volumes declare.
 - A replicated database's member not running (an old primary being
   rewound to rejoin) had its spool shipped only once it ran again, while
   the PostgreSQL plugin now waits for it to be shipped first: Legion

@@ -133,6 +133,11 @@ fn app(nfs: &str, portal: &str, target: &str, replicas: u32, run: &str) -> Strin
     let (server, path) = nfs.split_once(':').expect("server:/path");
     format!(
         r#"apiVersion: legion/v1
+kind: Namespace
+metadata: {{ name: shop }}
+spec: {{ security: {{ allow: [nfsVolumes, iscsiVolumes] }} }}
+---
+apiVersion: legion/v1
 kind: Volume
 metadata: {{ name: files, namespace: shop }}
 spec: {{ driver: nfs, nfs: {{ server: "{server}", path: "{path}", options: [nfsv3] }} }}
@@ -268,6 +273,11 @@ fn pod_on_network_storage() {
 fn provided(node: &str, replicas: u32, run: &str) -> String {
     format!(
         r#"apiVersion: legion/v1
+kind: Namespace
+metadata: {{ name: shop }}
+spec: {{ security: {{ allow: [nfsVolumes, iscsiVolumes] }} }}
+---
+apiVersion: legion/v1
 kind: Volume
 metadata: {{ name: pfiles, namespace: shop }}
 spec: {{ driver: nfs, size: 64Mi, nfs: {{ node: "{node}", options: [nfsv3] }} }}

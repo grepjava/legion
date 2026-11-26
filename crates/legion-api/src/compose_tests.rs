@@ -662,4 +662,14 @@ fn a_stacks_namespace_allows_what_its_containers_ask_for() {
     );
     let plain = convert_with("services:\n  web:\n    image: web\n", &[]).unwrap();
     assert_eq!(plain.namespace_spec(), json!({}));
+    // A Volume the host mounts, as the stack declares it: allowed too.
+    let nfs = convert_with(
+        "services:\n  a:\n    image: a\n    volumes: [shared:/srv]\nvolumes:\n  shared:\n    x-legion: { driver: nfs, nfs: { server: files, path: /export } }\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        nfs.namespace_spec(),
+        json!({ "security": { "allow": ["nfsVolumes"] } })
+    );
 }
