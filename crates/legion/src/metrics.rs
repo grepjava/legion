@@ -41,6 +41,18 @@ pub fn collect(
             if let Some(agent) = agent {
                 m.extend(agent().await);
             }
+            // A background loop that panicked, manager's or agent's, was
+            // said and started again: how often, by loop.
+            let panics = legion_runtime::supervise::panics();
+            if !panics.is_empty() {
+                let mut f = m.counter(
+                    "legion_task_panics_total",
+                    "Times one of the daemon's background loops panicked (and was started again, where it can be).",
+                );
+                for (task, n) in panics {
+                    f.sample(&[("task", task)], n as f64);
+                }
+            }
             m
         })
     })

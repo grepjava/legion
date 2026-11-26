@@ -13,10 +13,12 @@ legion-api.workspace = true
 serde.workspace = true
 futures.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros"] }
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros", "test-util"] }

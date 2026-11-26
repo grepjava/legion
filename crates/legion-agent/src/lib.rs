@@ -365,56 +365,89 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // state of each, which heartbeats report.
         let carp_held: CarpHeld = Arc::default();
         let carp_states: CarpStates = Arc::default();
-        let carp_watch = tokio::spawn(carp_watch(
-            ctx.sys.clone(),
-            carp_held.clone(),
-            carp_states.clone(),
-        ));
+        // Each loop supervised: one that panics is said, counted and
+        // started again, not left ended while the agent runs on without it
+        // (found by an audit).
+        use legion_runtime::supervise::{supervised, watched};
+        let carp_watch = {
+            let (sys, held, states) = (ctx.sys.clone(), carp_held.clone(), carp_states.clone());
+            supervised("carp-watch", None, move || {
+                carp_watch(sys.clone(), held.clone(), states.clone())
+            })
+        };
         // What the host lacks, checked again now and then for heartbeats to
         // carry, so a host put right takes tasks without a restart.
         let lacks: Lacks = Arc::default();
-        let host_checks = tokio::spawn(host_checks(
-            ctx.sys.clone(),
-            ctx.zfs_root.clone(),
-            lacks.clone(),
-        ));
+        let host_checks = {
+            let (sys, root, lacks) = (ctx.sys.clone(), ctx.zfs_root.clone(), lacks.clone());
+            supervised("host-checks", None, move || {
+                host_checks(sys.clone(), root.clone(), lacks.clone())
+            })
+        };
         // The host and its pools, read often for heartbeats to carry, so a
         // pool losing a device is seen within seconds.
         let hosted: Hosted = Arc::default();
-        let host_reads = tokio::spawn(host_reads(
-            ctx.sys.clone(),
-            ctx.control.clone(),
-            hosted.clone(),
-        ));
-        let heartbeats = tokio::spawn(heartbeats(
-            (heard.clone(), ctx.lease.clone()),
-            ctx.control.clone(),
-            ctx.node.clone(),
-            carp_states,
-            (lacks, hosted, ctx.members.clone()),
-            metrics::AgentMetrics {
+        let host_reads = {
+            let (sys, control, hosted) = (ctx.sys.clone(), ctx.control.clone(), hosted.clone());
+            supervised("host-reads", None, move || {
+                host_reads(sys.clone(), control.clone(), hosted.clone())
+            })
+        };
+        let heartbeats = {
+            let (heard, lease, control, node) = (
+                heard.clone(),
+                ctx.lease.clone(),
+                ctx.control.clone(),
+                ctx.node.clone(),
+            );
+            let (members, every) = (ctx.members.clone(), self.usage_period);
+            let metrics = metrics::AgentMetrics {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
                 node: ctx.node.clone(),
                 zfs_root: ctx.zfs_root.clone(),
                 build_root: self.builder.zfs_root(),
-            },
-            self.usage_period,
-        ));
-        let sessions = tokio::spawn(session::serve(
-            ctx.runtime.clone(),
-            ctx.node.clone(),
-            ctx.logs_dir.clone(),
-            Arc::new(transfer::Volumes {
+            };
+            supervised("heartbeats", None, move || {
+                heartbeats(
+                    (heard.clone(), lease.clone()),
+                    control.clone(),
+                    node.clone(),
+                    carp_states.clone(),
+                    (lacks.clone(), hosted.clone(), members.clone()),
+                    metrics.clone(),
+                    every,
+                )
+            })
+        };
+        let sessions = {
+            let (runtime, node, kept, builder, control) = (
+                ctx.runtime.clone(),
+                ctx.node.clone(),
+                ctx.logs_dir.clone(),
+                self.builder.clone(),
+                ctx.control.clone(),
+            );
+            // One for the agent's life, whatever restarts: the copies being
+            // received are known across them.
+            let volumes = Arc::new(transfer::Volumes {
                 sys: ctx.sys.clone(),
                 zfs_root: ctx.zfs_root.clone(),
                 lock: ctx.volume_lock.clone(),
                 iscsi: self.iscsi.clone(),
                 receiving: Default::default(),
-            }),
-            self.builder.clone(),
-            ctx.control.sessions(&ctx.node),
-        ));
+            });
+            supervised("sessions", None, move || {
+                session::serve(
+                    runtime.clone(),
+                    node.clone(),
+                    kept.clone(),
+                    volumes.clone(),
+                    builder.clone(),
+                    control.sessions(&node),
+                )
+            })
+        };
         let net = legion_net::PodNetwork::new(registration.pod_cidr);
         tracing::info!(subnet = %net.subnet, "pod network");
         let bridge = net.clone();
@@ -431,11 +464,10 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                     port: wg.port,
                     nat: wg.nat,
                 };
-                Some(tokio::spawn(mesh_peers(
-                    ctx.sys.clone(),
-                    ctx.control.peers(),
-                    mesh,
-                )))
+                let (sys, control) = (ctx.sys.clone(), ctx.control.clone());
+                Some(supervised("mesh", None, move || {
+                    mesh_peers(sys.clone(), control.peers(), mesh.clone())
+                }))
             }
             _ => None,
         };
@@ -454,49 +486,60 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 };
                 tracing::info!(%addr, https, "ingress proxy listening");
                 if !https {
-                    ingress.push(tokio::spawn(ingress::serve(
-                        listener,
-                        routes.clone(),
-                        endpoints.clone(),
-                    )));
+                    ingress.push(watched(
+                        "ingress",
+                        ingress::serve(listener, routes.clone(), endpoints.clone()),
+                    ));
                     continue;
                 }
                 let certificates: Arc<ingress::Certificates> = Arc::default();
                 let control = ctx.control.clone();
-                ingress.push(tokio::spawn(ingress::follow_certificates(
-                    routes.clone(),
-                    certificates.clone(),
-                    move |namespace, name| {
-                        let control = control.clone();
-                        async move {
-                            control
-                                .data(&namespace, legion_api::Kind::Secret, &name)
-                                .await
-                                .map_err(|e| e.to_string())
-                        }
-                    },
-                )));
-                ingress.push(tokio::spawn(ingress::serve_tls(
-                    listener,
-                    routes.clone(),
-                    endpoints.clone(),
-                    certificates,
-                )));
+                ingress.push(watched(
+                    "ingress-certificates",
+                    ingress::follow_certificates(
+                        routes.clone(),
+                        certificates.clone(),
+                        move |namespace, name| {
+                            let control = control.clone();
+                            async move {
+                                control
+                                    .data(&namespace, legion_api::Kind::Secret, &name)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            }
+                        },
+                    ),
+                ));
+                ingress.push(watched(
+                    "ingress-tls",
+                    ingress::serve_tls(listener, routes.clone(), endpoints.clone(), certificates),
+                ));
             }
         }
         let dns = match self.resolver.clone() {
             Some(r) => external_dns(endpoints.clone(), gateway, r).await,
             None => dns(endpoints.clone(), gateway).await,
         };
-        let lb = tokio::spawn(load_balancing(
-            ctx.sys.clone(),
-            endpoints.clone(),
-            subnet,
-            mesh.is_some(),
-            ctx.node.clone(),
-            self.load_balancer_interface.clone(),
-            carp_held,
-        ));
+        let lb = {
+            let (sys, endpoints, meshed, node, iface) = (
+                ctx.sys.clone(),
+                endpoints.clone(),
+                mesh.is_some(),
+                ctx.node.clone(),
+                self.load_balancer_interface.clone(),
+            );
+            supervised("load-balancing", None, move || {
+                load_balancing(
+                    sys.clone(),
+                    endpoints.clone(),
+                    subnet,
+                    meshed,
+                    node.clone(),
+                    iface.clone(),
+                    carp_held.clone(),
+                )
+            })
+        };
 
         let mut assignments = ctx.control.assignments(&ctx.node);
         // Nothing is reconciled before the first complete set of
@@ -539,24 +582,45 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ));
         }
 
-        let policy = tokio::spawn(policing_loop(
-            ctx.sys.clone(),
-            endpoints,
-            ctx.control.policies(),
-            assignments.clone(),
-            ctx.guarding.clone(),
-            gateway,
-        ));
-        let memory = tokio::spawn(memory::enforce(
-            ctx.sys.clone(),
-            ctx.memory.clone(),
-            self.memory_check,
-        ));
+        let policy = {
+            let (sys, control, assigned, guarding) = (
+                ctx.sys.clone(),
+                ctx.control.clone(),
+                assignments.clone(),
+                ctx.guarding.clone(),
+            );
+            supervised("policing", None, move || {
+                policing_loop(
+                    sys.clone(),
+                    endpoints.clone(),
+                    control.policies(),
+                    assigned.clone(),
+                    guarding.clone(),
+                    gateway,
+                )
+            })
+        };
+        let memory = {
+            let (sys, memory, every) = (ctx.sys.clone(), ctx.memory.clone(), self.memory_check);
+            supervised("memory", None, move || {
+                memory::enforce(sys.clone(), memory.clone(), every)
+            })
+        };
 
-        let quotas = tokio::spawn(quota_loop(ctx.clone(), assignments.clone(), self.resync));
+        let quotas = {
+            let (ctx, assigned, every) = (ctx.clone(), assignments.clone(), self.resync);
+            supervised("quotas", None, move || {
+                quota_loop(ctx.clone(), assigned.clone(), every)
+            })
+        };
 
         let (events_tx, mut events) = mpsc::channel(256);
-        let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
+        let forwarder = {
+            let ctx = ctx.clone();
+            supervised("events", None, move || {
+                forward_events(ctx.clone(), events_tx.clone())
+            })
+        };
         let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
         let mut running: JoinSet<(String, task::Ended)> = JoinSet::new();
         // Each worker's uid by its task: a worker that panics says none.
@@ -734,7 +798,7 @@ async fn dns(
     }
     tracing::info!(%addr, ?upstream, "node resolver");
     let (tx, rx) = watch::channel(Arc::new(Zone::default()));
-    Some(tokio::spawn(async move {
+    Some(legion_runtime::supervise::watched("dns", async move {
         let follow = async move {
             while endpoints.changed().await.is_ok() {
                 let zone = zone(&endpoints.borrow_and_update());
@@ -793,7 +857,7 @@ async fn external_dns(
         }
     }
     let zone = r.zone_file();
-    Some(tokio::spawn(async move {
+    Some(legion_runtime::supervise::watched("dns", async move {
         while endpoints.changed().await.is_ok() {
             let services = services(&endpoints.borrow_and_update());
             if let Err(e) = legion_net::dns::write_zone_file(&zone, &services) {

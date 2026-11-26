@@ -642,18 +642,24 @@ impl JailRuntime {
             used: Used::default(),
             creating: Arc::default(),
         };
-        tokio::spawn(watch_exits(
-            rt.sys.clone(),
-            rt.dir.clone(),
-            rt.boot.clone(),
-            rt.events.clone(),
-        ));
-        if config.prune_images {
-            tokio::spawn(prune_images(
-                rt.images.clone(),
+        // Supervised: a reaper that panicked would leave every container's
+        // exit unseen while the agent ran on (found by an audit).
+        {
+            let (sys, dir, boot, events) = (
+                rt.sys.clone(),
                 rt.dir.clone(),
-                rt.used.clone(),
-            ));
+                rt.boot.clone(),
+                rt.events.clone(),
+            );
+            legion_runtime::supervise::supervised("watch-exits", None, move || {
+                watch_exits(sys.clone(), dir.clone(), boot.clone(), events.clone())
+            });
+        }
+        if config.prune_images {
+            let (images, dir, used) = (rt.images.clone(), rt.dir.clone(), rt.used.clone());
+            legion_runtime::supervise::supervised("prune-images", None, move || {
+                prune_images(images.clone(), dir.clone(), used.clone())
+            });
         }
         Ok(rt)
     }

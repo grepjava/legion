@@ -44,8 +44,7 @@ pub(crate) async fn hand_over(
 ) -> Result<Duration, Status> {
     // One at a time: a second, ending first, would wake this leader in the
     // middle of the first's quiet (found by an audit).
-    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let Ok(_one) = ONE.try_lock() else {
+    let Ok(_one) = api.handing_over.try_lock() else {
         return Err(Status::aborted(
             "leadership is being handed over already; retry once it is done",
         ));

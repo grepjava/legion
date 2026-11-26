@@ -81,7 +81,7 @@ pub(crate) async fn bind(console: &Console) -> Result<TcpListener, crate::Error>
         .map_err(|e| format!("the console's address {}: {e}", console.listen).into())
 }
 
-pub(crate) async fn run(listener: TcpListener, console: Console, api: ApiService) {
+pub(crate) async fn run(listener: std::sync::Arc<TcpListener>, console: Console, api: ApiService) {
     let Some(peer) = api.peer_tls.clone() else {
         tracing::warn!("the console needs TLS; not serving it");
         return;

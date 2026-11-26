@@ -363,6 +363,15 @@ members are told their role only on nodes that read it.
   is now; it is left out (found by an audit). A move onto the node
   receiving a replica's copy waits for that copy to end (the agent refuses
   a second receive into the dataset) rather than destroy what it took.
+- The daemon's background loops (a manager's controllers, migrator,
+  alerting and the rest; an agent's heartbeats, sessions, load balancing,
+  policing; the jail runtime's reaper) are supervised: one that panics is
+  logged with what it said, counted in `legion_task_panics_total{task}`,
+  and started again after a pause growing to a minute, where before it
+  ended without a word and the daemon ran on without it. Those that own
+  what they serve (the audit writer, ingress listeners, the pods'
+  resolver) are not started again, but logged and counted. Found by an
+  audit.
 - From the same audit, smaller fixes: a support bundle masks a Config's
   data and text (strings, so they went out whole, the audit trail's
   included) and any field whose name says key; with `usernameClaim:

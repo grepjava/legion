@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 
 pub mod fence;
+pub mod supervise;
 
 /// The annotation a VM container's settings come in, as [`VmConfig`]'s
 /// JSON (DESIGN.md §6.8).

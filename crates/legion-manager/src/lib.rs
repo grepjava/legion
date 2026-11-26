@@ -354,37 +354,50 @@ impl Manager {
         };
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
         let usage = self.usage.clone();
-        let floor = tokio::spawn(upgrade::run(
-            self.store.clone(),
-            self.id,
-            self.speaking.clone(),
-            self.heard.clone(),
-            closing.clone(),
-        ));
-        let controllers = self.controllers.then(|| {
-            tokio::spawn(controller::run(
+        // Each loop supervised: one that panics is said, counted and
+        // started again (legion_runtime::supervise), not left ended while
+        // the manager runs on without it (found by an audit).
+        use legion_runtime::supervise::{supervised, watched};
+        let id = self.id;
+        let floor = {
+            let (store, speaking, heard, c) = (
                 self.store.clone(),
-                self.id,
-                usage.clone(),
+                self.speaking.clone(),
+                self.heard.clone(),
                 closing.clone(),
-            ))
+            );
+            supervised("floor", Some(closing.clone()), move || {
+                upgrade::run(
+                    store.clone(),
+                    id,
+                    speaking.clone(),
+                    heard.clone(),
+                    c.clone(),
+                )
+            })
+        };
+        let controllers = self.controllers.then(|| {
+            let (store, usage, c) = (self.store.clone(), usage.clone(), closing.clone());
+            supervised("controllers", Some(closing.clone()), move || {
+                controller::run(store.clone(), id, usage.clone(), c.clone())
+            })
         });
         let resolver = self.controllers.then(|| {
-            tokio::spawn(images::run(
+            let (store, loopback, insecure, c) = (
                 self.store.clone(),
-                self.id,
                 self.registry_loopback,
                 self.insecure_registries.clone(),
                 closing.clone(),
-            ))
+            );
+            supervised("resolver", Some(closing.clone()), move || {
+                images::run(store.clone(), id, loopback, insecure.clone(), c.clone())
+            })
         });
         let acme = self.controllers.then(|| {
-            tokio::spawn(acme::run(
-                self.store.clone(),
-                self.id,
-                self.acme_loopback,
-                closing.clone(),
-            ))
+            let (store, loopback, c) = (self.store.clone(), self.acme_loopback, closing.clone());
+            supervised("acme", Some(closing.clone()), move || {
+                acme::run(store.clone(), id, loopback, c.clone())
+            })
         });
         let issuer = match (&self.credentials, &self.authority) {
             (Some(c), Some(authority)) => Some(join::Issuer {
@@ -395,25 +408,35 @@ impl Manager {
             _ => None,
         };
         let vip = self.vip.clone().map(|(sys, config)| {
-            tokio::spawn(vip::run(
-                sys,
-                config,
-                self.store.raft.metrics(),
-                self.id,
-                closing.clone(),
-            ))
+            let (metrics, c) = (self.store.raft.metrics(), closing.clone());
+            supervised("vip", Some(closing.clone()), move || {
+                vip::run(sys.clone(), config.clone(), metrics.clone(), id, c.clone())
+            })
         });
-        let promote = tokio::spawn(join::promote_learners(self.store.clone(), closing.clone()));
+        let promote = {
+            let (store, c) = (self.store.clone(), closing.clone());
+            supervised("promote", Some(closing.clone()), move || {
+                join::promote_learners(store.clone(), c.clone())
+            })
+        };
         let sessions: std::sync::Arc<session::Hub> = Default::default();
         let activity: std::sync::Arc<activity::State> = Default::default();
         let migrator = self.controllers.then(|| {
-            tokio::spawn(migrate::run(
+            let (store, sessions, activity, c) = (
                 self.store.clone(),
                 sessions.clone(),
                 activity.clone(),
-                self.id,
                 closing.clone(),
-            ))
+            );
+            supervised("migrator", Some(closing.clone()), move || {
+                migrate::run(
+                    store.clone(),
+                    sessions.clone(),
+                    activity.clone(),
+                    id,
+                    c.clone(),
+                )
+            })
         });
         let (audit, audited) = audit::Audit::new(&self.name);
         let audit_lost = audit.lost();
@@ -444,49 +467,82 @@ impl Manager {
             registry_loopback: self.registry_loopback,
             insecure_registries: self.insecure_registries.clone().into(),
             witness: self.witness,
+            handing_over: Default::default(),
+            leaving: Default::default(),
         };
-        let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
-        let keeping = tokio::spawn(history::run(api.clone()));
-        let mirroring = tokio::spawn(mirror::run(api.clone()));
+        let stop = Some(api.closing.clone());
+        let names = {
+            let api = api.clone();
+            supervised("names", stop.clone(), move || {
+                managers::run(api.clone(), api.closing.clone())
+            })
+        };
+        let keeping = {
+            let api = api.clone();
+            supervised("keeping", stop.clone(), move || history::run(api.clone()))
+        };
+        let mirroring = {
+            let api = api.clone();
+            supervised("mirroring", stop.clone(), move || mirror::run(api.clone()))
+        };
         let builds = self.controllers.then(|| {
-            tokio::spawn(build::run(
-                api.clone(),
-                self.insecure_registries.clone(),
-                api.closing.clone(),
-            ))
+            let (api, insecure) = (api.clone(), self.insecure_registries.clone());
+            supervised("builds", stop.clone(), move || {
+                build::run(api.clone(), insecure.clone(), api.closing.clone())
+            })
         });
-        let alerting = tokio::spawn(alerts::track(
-            api.store.clone(),
-            api.alerts.clone(),
-            api.closing.clone(),
-        ));
+        let alerting = {
+            let api = api.clone();
+            supervised("alerting", stop.clone(), move || {
+                alerts::track(api.store.clone(), api.alerts.clone(), api.closing.clone())
+            })
+        };
         // Alerts sent to the receivers, while this manager leads.
-        let notifying = tokio::spawn(notify::run(api.clone()));
-        let eventing = tokio::spawn(events::track(
-            api.store.clone(),
-            api.events.clone(),
-            api.closing.clone(),
-        ));
-        let following = tokio::spawn(activity::track(
-            api.store.clone(),
-            api.activity.clone(),
-            api.closing.clone(),
-        ));
-        let console = console
-            .map(|(listener, config)| tokio::spawn(gateway::run(listener, config, api.clone())));
-        let rotation = tokio::spawn(ca::run(api.clone(), api.closing.clone()));
-        let demotion = tokio::spawn(roles::follow(
-            api.clone(),
-            self.demoted.clone(),
-            api.closing.clone(),
-        ));
-        let auditing = tokio::spawn(audit::run(
-            api.clone(),
-            audited,
-            audit_lost,
-            self.audit,
-            api.closing.clone(),
-        ));
+        let notifying = {
+            let api = api.clone();
+            supervised("notifying", stop.clone(), move || notify::run(api.clone()))
+        };
+        let eventing = {
+            let api = api.clone();
+            supervised("eventing", stop.clone(), move || {
+                events::track(api.store.clone(), api.events.clone(), api.closing.clone())
+            })
+        };
+        let following = {
+            let api = api.clone();
+            supervised("following", stop.clone(), move || {
+                activity::track(api.store.clone(), api.activity.clone(), api.closing.clone())
+            })
+        };
+        let console = console.map(|(listener, config)| {
+            let (api, listener) = (api.clone(), std::sync::Arc::new(listener));
+            supervised("console", stop.clone(), move || {
+                gateway::run(listener.clone(), config.clone(), api.clone())
+            })
+        });
+        let rotation = {
+            let api = api.clone();
+            supervised("rotation", stop.clone(), move || {
+                ca::run(api.clone(), api.closing.clone())
+            })
+        };
+        let demotion = {
+            let (api, demoted) = (api.clone(), self.demoted.clone());
+            supervised("demotion", stop.clone(), move || {
+                roles::follow(api.clone(), demoted.clone(), api.closing.clone())
+            })
+        };
+        // What it drains is its own: not started again, but said.
+        let auditing = watched(
+            "auditing",
+            audit::run(
+                api.clone(),
+                audited,
+                audit_lost,
+                self.audit,
+                api.closing.clone(),
+            ),
+        );
         let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
             api.clone(),
             self.credentials.is_some(),

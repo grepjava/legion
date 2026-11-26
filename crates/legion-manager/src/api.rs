@@ -80,6 +80,11 @@ pub struct ApiService {
     pub(crate) insecure_registries: std::sync::Arc<[String]>,
     /// A witness: it votes, runs no tasks and never leads (docs/HA.md).
     pub(crate) witness: bool,
+    /// Held while leadership is handed over ([`crate::lead::hand_over`]),
+    /// and while a manager leaves the membership: one at a time, for this
+    /// manager (not the process: tests run several in one).
+    pub(crate) handing_over: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) leaving: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) enum Route {
@@ -1175,8 +1180,7 @@ impl ApiService {
     /// each leave the other's manager the last (found by an audit).
     pub(crate) async fn leave_membership(&self, name: &str) -> Result<(), Status> {
         use openraft::ChangeMembers;
-        static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _one = ONE_AT_A_TIME.lock().await;
+        let _one = self.leaving.lock().await;
         let Some(id) = crate::managers::id_of(&self.store, name)? else {
             return Ok(());
         };
