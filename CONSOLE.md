@@ -433,7 +433,14 @@ session.
 - *Who.* An OIDC user is named `oidc:` and the claim configured
   (`email` by default), so no name from a provider can be a certificate
   user's, which are DNS labels. Their groups are the configured claim's
-  (`groups`).
+  (`groups`). An `email` is taken only when the ID token also has
+  `email_verified: true`: one a provider says nothing about could be
+  anyone's. Microsoft Entra ID leaves `email_verified` out of its ID
+  tokens, so its users cannot sign in by `email`: set `usernameClaim` to
+  `oid` (the user's object ID, stable across the tenant),
+  `preferred_username` (the sign-in name; the tenant's admin controls it),
+  or `sub`. RoleBindings then name `oidc:<that value>`. The same applies to
+  any provider that omits `email_verified`.
 - *Rights stay in the bindings.* A RoleBinding names a `user` or a
   `group`. At sign-in the leader records the user's groups in the reserved
   namespace, until their newest session ends; RBAC gives a user what their

@@ -63,7 +63,7 @@ Rotate the cluster CA across all managers and nodes, or inspect CA rotation stat
 ### `legion console <login|settings|configure|oidc>`
 - `login [--url <URL>]`: Print a one-time browser sign-in URL (valid 60 s) for the web console.
 - `settings` / `configure -f <FILE>`: Print or update console settings (banner, sidebar links, default namespace, session lifetime).
-- `oidc [-f <FILE>] [--remove]`: View, configure, or disable OIDC single sign-on.
+- `oidc [-f <FILE>] [--remove]`: View, configure, or disable OIDC single sign-on. With `usernameClaim: email` (the default), the ID token must carry `email_verified: true`. Providers that omit it, such as Microsoft Entra ID, need another claim (`oid`, `preferred_username` or `sub`); see CONSOLE.md.
 
 ### `legion user create <NAME> [--role <view|edit|admin> -n <NS>] [-o <FILE>] [--days <N>]`
 Generate a client certificate PEM for a user and optionally create a `RoleBinding`.
