@@ -168,6 +168,16 @@ pub(crate) fn no_quorum() -> tonic::Status {
 /// then come after 5 to 10 s of silence, close to Swarm's default.
 /// Snapshot chunks stay well under the gRPC message limit after JSON
 /// encoding.
+///
+/// A snapshot goes to a manager whose log the leader has compacted past: one
+/// joining once the cluster has run a while, or one back after a long time
+/// away. Each chunk must arrive within `install_snapshot_timeout`, which
+/// openraft leaves at 200 ms: under a round trip to a witness across the
+/// internet (230 ms from a home uplink), so such a manager could never join
+/// and was sent the first chunk again every 200 ms without end (seen
+/// 2026-11-27, a new witness on a VPS). A chunk is 256 KiB, at most about
+/// 1 MiB once JSON-encoded (bytes as numbers), which a 4 Mbit/s uplink
+/// carries in about 2 s; it has [`SNAPSHOT_CHUNK_TIME`].
 pub fn default_raft_config() -> openraft::Config {
     openraft::Config {
         cluster_name: "legion".into(),
@@ -175,10 +185,16 @@ pub fn default_raft_config() -> openraft::Config {
         election_timeout_min: 5000,
         election_timeout_max: 10_000,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
-        snapshot_max_chunk_size: 1024 * 1024,
+        snapshot_max_chunk_size: SNAPSHOT_CHUNK,
+        install_snapshot_timeout: SNAPSHOT_CHUNK_TIME.as_millis() as u64,
         ..Default::default()
     }
 }
+
+/// Bytes of snapshot a chunk carries (see [`default_raft_config`]).
+const SNAPSHOT_CHUNK: u64 = 256 * 1024;
+/// How long a snapshot chunk may take to arrive.
+const SNAPSHOT_CHUNK_TIME: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct Manager {
     id: NodeId,
@@ -716,5 +732,31 @@ pub fn node_id(dir: &Path) -> Result<NodeId, Error> {
             Ok(id)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod raft_config_tests {
+    use std::time::Duration;
+
+    /// A snapshot chunk, at its largest once encoded (every byte 255),
+    /// arrives over a slow uplink to a witness far off well within the time
+    /// it has: openraft's 200 ms default was under the round trip alone,
+    /// so a witness on a VPS never got its snapshot (2026-11-27).
+    #[test]
+    fn a_snapshot_chunk_reaches_a_witness_across_a_slow_uplink_in_time() {
+        let c = super::default_raft_config();
+        let chunk = vec![255u8; c.snapshot_max_chunk_size as usize];
+        let encoded = serde_json::to_vec(&chunk).unwrap().len();
+        // 4 Mbit/s up, 230 ms away: what the real cluster's witness has.
+        let rate = 4_000_000.0 / 8.0;
+        let takes = Duration::from_millis(2 * 230) + Duration::from_secs_f64(encoded as f64 / rate);
+        let has = c.install_snapshot_timeout();
+        assert!(
+            takes * 4 <= has,
+            "a {encoded}-byte chunk takes about {takes:?} of the {has:?} it has"
+        );
+        // And under the gRPC message limit by far.
+        assert!(encoded * 8 < crate::raft_net::MAX_MESSAGE, "{encoded}");
     }
 }

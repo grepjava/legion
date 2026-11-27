@@ -288,6 +288,16 @@ members are told their role only on nodes that read it.
 
 ### Fixed
 
+- **A manager far off can join a cluster that has run a while.** A new
+  manager (or one back after long away) is sent a snapshot of the store,
+  each chunk within openraft's default 200 ms: under the round trip to a
+  witness across the internet, so it never arrived, and the leader sent the
+  first chunk again every 200 ms without end. Each chunk (now 256 KiB) has
+  30 s.
+- **A witness gone for good can be removed** (`legion delete node NAME`,
+  checked first as a node's removal is), as can a manager started without
+  an agent: neither has a Node, so the removal answered "not found" and the
+  lost manager kept counting toward the quorum.
 - **Console: the Images page's search no longer repeats endlessly.** On
   opening the search tab, a search that found nothing, or failed (a
   registry unreachable), was sent again as soon as it answered, without

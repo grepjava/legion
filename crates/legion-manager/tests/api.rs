@@ -7716,3 +7716,105 @@ async fn a_users_event_stream_ends_when_their_binding_goes() {
     let e = ended.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied, "{e}");
 }
+
+/// A witness whose machine is gone for good is removed by name, as a
+/// manager's Node deleted removes it: it has no Node (it runs no agent), so
+/// it could not be removed at all, and kept counting toward the quorum
+/// without answering (found 2026-11-27, a witness's VPS destroyed). Checked
+/// first like any node's removal; a second removal, or a name no manager
+/// has, is not found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_witness_gone_for_good_is_removed_by_name() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    let witness = join_witness(&first.addr, &token, "w", admin.clone()).await;
+    let witness_id = witness.store.raft.metrics().borrow().id;
+    let mut c = first.cluster().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = availability(&mut c, "").await;
+        if r.managers.iter().filter(|m| m.voter).count() == 3
+            && r.managers.iter().any(|m| m.name == "w" && m.witness)
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Gone for good.
+    witness.stop().await;
+
+    let checked = c
+        .dry_run(legion_proto::v1::DryRunRequest {
+            change_json: serde_json::to_vec(&legion_api::dryrun::Change::RemoveNode {
+                node: "w".into(),
+            })
+            .unwrap(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let d: legion_api::dryrun::DryRun = serde_json::from_slice(&checked.dry_run_json).unwrap();
+    assert!(d.moves.is_empty() && d.stopped == 0, "{d:?}");
+    assert!(!d.blocks(), "{d:?}");
+
+    let remove = |name: &str| DeleteRequest {
+        r#ref: Some(ObjectRef {
+            kind: "Node".into(),
+            namespace: String::new(),
+            name: name.into(),
+        }),
+        expected_version: None,
+    };
+    let mut o = first.objects().await;
+    o.delete(remove("w")).await.unwrap();
+    let members = |m: &Running| -> Vec<u64> {
+        let r = m.store.raft.metrics().borrow().clone();
+        r.membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    until("the witness out of the membership", || {
+        !members(&first).contains(&witness_id) && !members(&second).contains(&witness_id)
+    })
+    .await;
+    assert_eq!(
+        first
+            .store
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .count(),
+        2
+    );
+    // The two left still write.
+    eventually(|| {
+        let mut o = o.clone();
+        async move { o.apply(apply(service("after", 1))).await }
+    })
+    .await;
+    for name in ["w", "nobody"] {
+        let err = o.delete(remove(name)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound, "{name}: {err}");
+    }
+    second.stop().await;
+}

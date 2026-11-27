@@ -1131,7 +1131,9 @@ impl ApiService {
     ) -> Result<Outcome, Status> {
         let precondition = expected_version.map_or(Precondition::None, Precondition::Version);
         let Some(node) = self.store.get(key).map_err(internal)? else {
-            return Ok(Outcome::NotFound);
+            return self
+                .remove_manager_without_node(&key.name, expected_version)
+                .await;
         };
         if expected_version.is_some_and(|v| v != node.metadata.version) {
             return Ok(Outcome::Conflict {
@@ -1170,6 +1172,37 @@ impl ApiService {
             tracing::warn!(node = %key.name, "marking its Volumes lost: {e}");
         }
         deleted
+    }
+
+    /// Removes the manager named `name` that has no Node, as it runs no
+    /// agent (a witness, or a manager started with `--no-agent`): out of
+    /// the membership, its certificate refused, as a manager's Node
+    /// deleted does. Such a manager lost for good (its machine gone) could
+    /// not be removed before, so it kept counting toward the quorum without
+    /// ever answering (found 2026-11-27, a witness's VPS destroyed). Not
+    /// found when `name` is no manager, or a version was asked for: there is
+    /// no object to have one.
+    async fn remove_manager_without_node(
+        &self,
+        name: &str,
+        expected_version: Option<u64>,
+    ) -> Result<Outcome, Status> {
+        let member = crate::managers::id_of(&self.store, name)?.is_some_and(|id| {
+            let m = self.store.raft.metrics().borrow().clone();
+            m.membership_config
+                .membership()
+                .nodes()
+                .any(|(n, _)| *n == id)
+        });
+        if expected_version.is_some() || !member {
+            return Ok(Outcome::NotFound);
+        }
+        let recorded = crate::removed::record(self, name).await?;
+        if let Err(e) = self.leave_membership(name).await {
+            crate::removed::forget(self, name, recorded).await?;
+            return Err(e);
+        }
+        Ok(Outcome::Deleted { version: 0 })
     }
 
     /// Takes the manager named `name` out of the Raft membership, if it is
@@ -2476,6 +2509,21 @@ impl Cluster for ApiService {
         use crate::controller::plan::dryrun::Refused;
         let mut d = match done {
             Ok(d) => d,
+            // A manager with no Node (a witness, or one without an agent):
+            // removing it moves nothing; only what the managers are left
+            // with, below.
+            Err(Refused::NotFound(_))
+                if matches!(&change, Change::RemoveNode { node }
+                    if crate::managers::id_of(&self.store, node)?.is_some()) =>
+            {
+                legion_api::dryrun::DryRun {
+                    change: change.clone(),
+                    findings: Vec::new(),
+                    moves: Vec::new(),
+                    stopped: 0,
+                    hidden: 0,
+                }
+            }
             Err(Refused::NotFound(m)) => return Err(Status::not_found(m)),
             Err(Refused::Invalid(m)) => return Err(Status::invalid_argument(m)),
         };

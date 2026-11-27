@@ -50,6 +50,15 @@ legion join --witness --manager m1.example.org:7470 LGN-1-...
 service legion start
 ```
 
+A witness whose machine is gone for good is removed by its name, as any
+manager is: `legion delete node NAME` (checked first, as a node's removal
+is). It has no Node (it runs no agent), which used to leave it
+unremovable, counting toward the quorum without ever answering. Join its
+replacement first, then remove it, so the cluster never drops to two
+voters. A new manager joining a cluster that has run a while is sent a
+snapshot of the store: each chunk has 30 s, which a witness across a slow
+uplink needs (openraft's default of 200 ms is under such a round trip).
+
 The witness's data directory says it is one (a `witness` file), so its
 daemon starts as a witness without being told (`legion daemon --witness`
 does the same for a manager already joined). It never runs an agent, and
