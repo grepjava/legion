@@ -345,11 +345,18 @@ impl DispatcherService {
                 .any(|o| o.metadata.name == node && marked(o)))
     }
 
+    /// The managers an agent may turn to: not witnesses, which serve no
+    /// clients (they pass a call on to the leader, which one far off may
+    /// not reach) and whose machine may be gone: an agent that turned to a
+    /// destroyed witness's address failed its task's start on a timeout
+    /// (seen 2026-11-27).
     fn managers(&self) -> Vec<String> {
+        let witnesses = crate::managers::witnesses(self.store()).unwrap_or_default();
         let m = self.store().raft.metrics().borrow().clone();
         m.membership_config
             .membership()
             .nodes()
+            .filter(|(id, _)| !witnesses.contains(id))
             .map(|(_, n)| n.addr.clone())
             .collect()
     }
