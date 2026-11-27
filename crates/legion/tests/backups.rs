@@ -4,9 +4,9 @@
 //! pruned there too; one is restored onto n3 as a new Volume with the data
 //! as it was; then to a directory on n2, a file each; then to an S3 bucket
 //! (MinIO on n3), an object each, one restored from there. Then back to
-//! n3 over SSH through a failover of the leader and a drain of n2, which
-//! moves the Volume to n3: both schedules go on, pruned to `keep`, and a
-//! backup taken after the move restores on n1. No `snapshot-late` or
+//! n3 over SSH through a failover of the leader, a move of the Volume to
+//! n3 and a drain of n2, where it was: both schedules go on, pruned to
+//! `keep`, and a backup taken after the move restores on n1. No `snapshot-late` or
 //! `backup-late` alert stands at the end.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
@@ -537,10 +537,25 @@ true
     lab.restart_vm(vm("n3"), common::Role::Manager);
     lab.wait_or_report("n3 back", 120, || lab.node_state("n3") == "ready");
 
-    // A drain: the Volume moves to n3 with its writer. The base it backed
-    // up from stays on n2, so the first backup from n3 is whole and the
-    // next what changed since; both schedules carry on pruned to `keep`.
+    // A move, then a drain: the Volume goes to n3 with its writer (a drain
+    // moves only a stateful service's Volumes; a Volume of its own is
+    // moved by asking, DESIGN.md 4.3), then n2, where it was, is drained.
+    // The base it backed up from stays on n2, so the first backup from n3
+    // is whole and the next what changed since; both schedules carry on
+    // pruned to `keep`.
     let before = last_ok(&volume(&lab)).unwrap();
+    lab.ok(&["volume", "move", "data", "n3"]);
+    lab.wait_or_report("the Volume on n3, its writer with it", 900, || {
+        let v = volume(&lab);
+        v["status"]["node"] == "n3"
+            && v["status"]["migration"].is_null()
+            && lab.list("tasks", "default").iter().any(|t| {
+                t["spec"]["service"] == "writer"
+                    && t["spec"]["desiredState"] == "running"
+                    && t["status"]["state"] == "running"
+                    && t["spec"]["node"] == "n3"
+            })
+    });
     let out = lab.legion(
         &[
             "node",
@@ -565,7 +580,7 @@ true
     assert_eq!(
         volume(&lab)["status"]["node"],
         "n3",
-        "the Volume moved with its writer"
+        "the Volume stays where it was moved"
     );
     check_schedules_go_on(&lab, "n3", "n2 drained");
     let v = volume(&lab);
