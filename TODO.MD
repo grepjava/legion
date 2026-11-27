@@ -80,7 +80,8 @@ lab covers it.
 - Checked on the Ryzen: snapshots and directory backups pruned to `keep`; restore and clone hold the data as at their time.
 - Lab test: `volumes_keep_scheduled_snapshots_and_backups_that_restore`, n3 as the SSH host.
 - S3-compatible targets (24 November 2026): `s3: {endpoint, region, bucket, prefix, accessKeyId, secretKeySecret, virtualHosted}`, each backup a whole object, sent as a multipart upload; signed with Signature Version 4 (checked against AWS's own example) by the agent itself.
-- Left: the failover and drain cases of "done when" are covered by the status carrying over moves and promotions, but not yet run in the lab.
+- Failover and drain in the lab (28 November 2026, 4cf38ea): the same test then stops n3, the leading manager, and both schedules go on from n2 under the new leader; the Volume is moved to n3 and n2, where it was, drained: the first backup from n3 is whole, the next what changed, both pruned to `keep`, and one restores on n1, a node that never held the data. A drain moves only a stateful service's Volumes (§4.3); a Volume of its own is moved with `legion volume move`, and a drain that would leave its task waiting on it is refused, as the first run found.
+- Done.
 
 ## 2. Moving a Volume while it runs
 
