@@ -593,7 +593,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .into_inner();
             let base = match url {
                 Some(u) => u.trim_end_matches('/').to_owned(),
+                // The manager's word: its console as a browser reaches it.
+                None if !code.url.is_empty() => code.url.clone(),
                 None => {
+                    // A manager that serves none, or one from before it
+                    // said: the --server host, the default port.
                     let host = host_port(server)
                         .rsplit_once(':')
                         .map_or(host_port(server), |(h, _)| h);
@@ -603,6 +607,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             // In the fragment: never sent to a server, nor kept in its logs.
             println!("{base}/login#code={}", code.code);
             eprintln!("open it within 60 s; it signs you in once");
+            if loopback_url(&base) {
+                eprintln!(
+                    "{base} is this host's own: from elsewhere, forward the port                      (ssh -L) or give --url"
+                );
+            }
         }
         Command::Ca { action } => {
             let r = cluster
@@ -3149,6 +3158,19 @@ fn host_port(server: &str) -> &str {
         .unwrap_or(server)
 }
 
+/// A console link only this host can open: 127.0.0.1, ::1 or localhost.
+fn loopback_url(url: &str) -> bool {
+    let rest = host_port(url);
+    let host = match rest.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => rest.split([':', '/']).next().unwrap_or(""),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()> {
     let key = match key_file {
         Some(f) => {
@@ -3886,6 +3908,27 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_console_link_only_this_host_opens_is_told_apart() {
+        for url in [
+            "https://127.0.0.1:7480",
+            "https://127.9.9.9",
+            "https://localhost:7480",
+            "https://LOCALHOST/",
+            "https://[::1]:7480",
+        ] {
+            assert!(loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://192.168.100.219:7480",
+            "https://[fd00::1]:7480",
+            "https://console.example.org",
+            "https://localhost.example.org:7480",
+        ] {
+            assert!(!loopback_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn a_pools_row_says_how_full_its_errors_and_its_last_scrub() {

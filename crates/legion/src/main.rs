@@ -285,9 +285,11 @@ enum Command {
     Console {
         #[arg(value_parser = ["login", "settings", "configure", "oidc"])]
         action: String,
-        /// The console's address, as a browser reaches it [default: the
-        /// --server host, port 7480].
-        #[arg(long)]
+        /// For `login`: the console's address, as a browser reaches it
+        /// [default: single sign-on's consoleUrl when set, else the
+        /// console of the manager reached, as it listens: its advertised
+        /// host when it listens on every address].
+        #[arg(long, env = "LEGION_CONSOLE_URL")]
         url: Option<String>,
         /// For `configure` and `oidc`: the settings, as YAML; `-` for stdin.
         #[arg(short, long)]

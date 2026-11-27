@@ -716,7 +716,13 @@ binary serves it.
 - **Sign-in.** `legion console login` (the user's CLI, with their
   certificate) asks the manager for a one-time code bound to their
   identity (`Cluster.ConsoleCode`: 60 s, one use) and prints the
-  console's URL with it. The browser exchanges the code for a session.
+  console's URL with it, as the manager reached says a browser reaches
+  its console: single sign-on's `consoleUrl` when set, else the name on
+  `--console-cert`, else the address `--console-listen` gives (the
+  manager's advertised host when that is every address); `--url` or
+  `LEGION_CONSOLE_URL` say otherwise. The code rides in the fragment, so
+  the host named changes nothing about who may use it. The browser
+  exchanges the code for a session.
   No private key ever leaves the user's machine, and the browser never
   holds one. Single sign-on (OIDC) comes later (CONSOLE.md phase 6),
   mapped onto the same identities.

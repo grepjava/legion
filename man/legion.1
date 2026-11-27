@@ -320,6 +320,14 @@ Default manager address for
 .It Ev LEGION_IDENTITY
 Default client credentials PEM path for
 .Fl -identity .
+.It Ev LEGION_CONSOLE_URL
+Default for
+.Cm console login Fl -url :
+the console's address as a browser reaches it.
+Unset, the link names single sign-on's
+.Li consoleUrl
+when one is set, else the console of the manager reached as it
+listens, its advertised host when it listens on every address.
 .It Ev LEGION_LOCAL_STATE_DIR , LEGION_LOCAL_ZFS_ROOT , LEGION_LOCAL_NO_ZFS , LEGION_LOCAL_POD_SUBNET , LEGION_LOCAL_CACHE_MAX , LEGION_LOCAL_SSH
 Defaults for local store and build options under
 .Cm build
