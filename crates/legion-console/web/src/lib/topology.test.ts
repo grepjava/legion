@@ -5,6 +5,7 @@ import {
   BAND_GAP,
   BAND_HEAD,
   BAND_PAD,
+  currentTasks,
   HEADER_H,
   TASK_STEP,
   nodeBands,
@@ -28,6 +29,27 @@ const edge = (
   ({ from, to, port, protocol: 'tcp', via: 'task', connections, clients: 1 }) as unknown as ConnectionEdge;
 
 describe('the topology', () => {
+  it('draws what runs in each slot, not the failed tasks it replaced', () => {
+    const tk = (name: string, slot: number, state: string, service = 'api') =>
+      ({ metadata: { name }, spec: { service, slot }, status: { state } }) as unknown as LObject;
+    const names = (l: LObject[]) => l.map((t) => t.metadata.name).sort();
+    expect(
+      names(
+        currentTasks([
+          tk('api-1-23', 1, 'failed'),
+          tk('api-1-24', 1, 'failed'),
+          tk('api-1-26', 1, 'running'),
+          tk('api-1-25', 1, 'shutdown'),
+          tk('api-2-3', 2, 'starting')
+        ])
+      )
+    ).toEqual(['api-1-26', 'api-2-3']);
+    // A slot whose every try failed shows its newest, so the failure shows.
+    expect(names(currentTasks([tk('api-1-9', 1, 'failed'), tk('api-1-10', 1, 'failed')]))).toEqual([
+      'api-1-10'
+    ]);
+  });
+
   it('lists published ports with where they are answered, null until published', () => {
     const web = svc(
       'web',

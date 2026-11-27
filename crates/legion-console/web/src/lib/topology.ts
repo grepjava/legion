@@ -58,6 +58,27 @@ export function publishedPorts(services: LObject[]): Published[] {
   });
 }
 
+/** What runs, or last tried to, in each of a Service's slots: the task
+ * there that is not over, else its newest that failed. A task that failed
+ * stays recorded once another replaced it, which drew a pod that runs no
+ * jail beside the one that does (seen 2026-11-27, after an outage). Tasks
+ * that were shut down are gone. */
+export function currentTasks(tasks: LObject[]): LObject[] {
+  const over = (tk: LObject) => ['failed', 'rejected', 'complete'].includes(tk.status?.state);
+  const attempt = (tk: LObject) => Number(/-(\d+)$/.exec(tk.metadata.name)?.[1] ?? 0);
+  const slots = new Map<string, LObject[]>();
+  for (const tk of tasks) {
+    if (tk.status?.state === 'shutdown') continue;
+    const key = `${tk.spec?.service ?? ''}/${tk.spec?.slot ?? tk.spec?.node ?? tk.metadata.name}`;
+    slots.set(key, [...(slots.get(key) ?? []), tk]);
+  }
+  return [...slots.values()].flatMap((list) => {
+    const live = list.filter((tk) => !over(tk));
+    if (live.length) return live;
+    return [list.reduce((a, b) => (attempt(b) > attempt(a) ? b : a))];
+  });
+}
+
 /** The Volumes each Service mounts. */
 export function volumeUses(services: LObject[]): Use[] {
   return services.flatMap((s) =>

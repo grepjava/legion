@@ -48,6 +48,7 @@
     X_VOL,
     conns,
     containerPorts,
+    currentTasks,
     isVm,
     nodeBands,
     nodeHealth,
@@ -255,7 +256,7 @@
   });
 
   const svcRow = $derived(new Map(services.map((s, i) => [s.metadata.name, i])));
-  const activeTasks = $derived(tasks.filter((tk) => tk.status?.state !== 'shutdown'));
+  const activeTasks = $derived(currentTasks(tasks));
   const tasksBySvc = $derived.by(() => {
     const m = new Map<string, LObject[]>();
     for (const tk of activeTasks) {
