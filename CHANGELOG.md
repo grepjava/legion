@@ -248,6 +248,12 @@ members are told their role only on nodes that read it.
 
 ### Web console
 
+- **`legion console login`'s link names the console as a browser reaches
+  it,** said by the manager asked: single sign-on's `consoleUrl` when set,
+  else the name on `--console-cert`, else the address it listens on, its
+  advertised host when that is every address. It named the `--server`
+  host, 127.0.0.1 run on a manager, a link no other machine could open.
+  `LEGION_CONSOLE_URL` sets `--url`; a link only this host opens says so.
 - **Phases 7 to 12** ([CONSOLE.md](CONSOLE.md)): replicas in view and
   promoted from a Volume's page, nodes' hosts and pools, alert receivers,
   long operations in the bottom bar, what a drain, move or delete would do
