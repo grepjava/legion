@@ -392,6 +392,10 @@ message ConsoleCodeRequest {
 message ConsoleCodeResponse {
   string code = 1;
   int64 expires_ms = 2;
+  // Where a browser reaches the console of the manager asked: single
+  // sign-on's console address when set, else its own; empty when it
+  // serves none (and from managers before this field).
+  string url = 3;
 }
 
 message ConsoleSessionRequest {

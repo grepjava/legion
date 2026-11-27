@@ -81,6 +81,38 @@ pub(crate) async fn bind(console: &Console) -> Result<TcpListener, crate::Error>
         .map_err(|e| format!("the console's address {}: {e}", console.listen).into())
 }
 
+/// Where a browser reaches this console, for `legion console login`'s
+/// link: the name its own certificate is for, else the address it
+/// listens on, the manager's advertised host when that is every address.
+pub(crate) fn base_url(console: &Console, bound: SocketAddr, advertise: &str) -> String {
+    let named = console
+        .cert_pem
+        .as_deref()
+        .and_then(|pem| legion_pki::dns_names(pem).ok())
+        .and_then(|names| names.into_iter().find(|n| !n.starts_with('*')));
+    let host = match named {
+        Some(name) => name,
+        None if bound.ip().is_unspecified() => {
+            let host = advertise
+                .rsplit_once(':')
+                .map_or(advertise, |(h, _)| h)
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            match host.parse::<std::net::IpAddr>() {
+                Ok(ip) if ip.is_unspecified() => "127.0.0.1".to_owned(),
+                Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+                _ if host.is_empty() => "127.0.0.1".to_owned(),
+                _ => host.to_owned(),
+            }
+        }
+        None => match bound.ip() {
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            ip => ip.to_string(),
+        },
+    };
+    format!("https://{host}:{}", bound.port())
+}
+
 pub(crate) async fn run(listener: std::sync::Arc<TcpListener>, console: Console, api: ApiService) {
     let Some(peer) = api.peer_tls.clone() else {
         tracing::warn!("the console needs TLS; not serving it");
@@ -3947,6 +3979,67 @@ async fn page(uri: Uri) -> Result<Response, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sign_in_link_names_where_a_browser_reaches_the_console() {
+        let console = |cert_pem: Option<String>| Console {
+            listen: "0.0.0.0:7480".parse().unwrap(),
+            cert_pem,
+            key_pem: None,
+        };
+        let url = |c: &Console, bound: &str, advertise: &str| {
+            base_url(c, bound.parse().unwrap(), advertise)
+        };
+        let own = console(None);
+        // Every address: the one the manager advertises, the console's port.
+        assert_eq!(
+            url(&own, "0.0.0.0:7480", "192.168.100.219:7470"),
+            "https://192.168.100.219:7480"
+        );
+        assert_eq!(
+            url(&own, "[::]:8443", "node1.example:7470"),
+            "https://node1.example:8443"
+        );
+        assert_eq!(
+            url(&own, "[::]:7480", "[fd00::1]:7470"),
+            "https://[fd00::1]:7480"
+        );
+        // Nothing better to say than this host.
+        assert_eq!(
+            url(&own, "0.0.0.0:7480", "0.0.0.0:7470"),
+            "https://127.0.0.1:7480"
+        );
+        // One address: that one, loopback too (reached through a tunnel).
+        assert_eq!(
+            url(&own, "10.0.0.5:7480", "192.168.100.219:7470"),
+            "https://10.0.0.5:7480"
+        );
+        assert_eq!(
+            url(&own, "127.0.0.1:7480", "192.168.100.219:7470"),
+            "https://127.0.0.1:7480"
+        );
+        assert_eq!(url(&own, "[::1]:7480", "x:7470"), "https://[::1]:7480");
+        // A certificate of its own: the name it is for, wildcards passed over.
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "*.example.org".to_owned(),
+            "console.example.org".to_owned(),
+        ])
+        .unwrap()
+        .cert
+        .pem();
+        assert_eq!(
+            url(&console(Some(cert)), "0.0.0.0:7480", "192.168.100.219:7470"),
+            "https://console.example.org:7480"
+        );
+        let wild = rcgen::generate_simple_self_signed(vec!["*.example.org".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        assert_eq!(
+            url(&console(Some(wild)), "0.0.0.0:7480", "192.168.100.219:7470"),
+            "https://192.168.100.219:7480"
+        );
+    }
 
     #[test]
     fn only_the_pages_own_inline_scripts_are_allowed() {

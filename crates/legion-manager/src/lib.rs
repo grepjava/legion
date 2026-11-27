@@ -457,6 +457,14 @@ impl Manager {
         });
         let (audit, audited) = audit::Audit::new(&self.name);
         let audit_lost = audit.lost();
+        // Only a console that will serve: it needs TLS and the CA key.
+        let console_url = match &console {
+            Some((listener, config)) if self.credentials.is_some() && issuer.is_some() => listener
+                .local_addr()
+                .ok()
+                .map(|bound| gateway::base_url(config, bound, &self.advertise)),
+            _ => None,
+        };
         let api = api::ApiService {
             id: self.id,
             audit,
@@ -466,6 +474,7 @@ impl Manager {
             ))),
             name: self.name.clone(),
             advertise: self.advertise.clone(),
+            console_url,
             store: self.store.clone(),
             closing,
             peer_tls: self.credentials.clone(),

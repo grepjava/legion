@@ -44,6 +44,8 @@ pub struct ApiService {
     pub(crate) history: crate::history::Shared,
     /// `host:port` peers and forwarded requests reach this manager at.
     pub(crate) advertise: String,
+    /// Where a browser reaches this manager's console, if it serves one.
+    pub(crate) console_url: Option<String>,
     pub(crate) store: Store,
     /// Becomes true when the manager shuts down; open watches then end so
     /// the server's graceful shutdown can finish.
@@ -132,6 +134,16 @@ fn leaving_voter(
 }
 
 impl ApiService {
+    /// Where `legion console login`'s link points: single sign-on's
+    /// console address when one is set, as the cluster's own; else this
+    /// manager's console; empty when it serves none.
+    pub(crate) fn console_link(&self) -> Result<String, Status> {
+        if let Some(r) = crate::console::oidc(&self.store)? {
+            return Ok(r.oidc.console_url.trim_end_matches('/').to_owned());
+        }
+        Ok(self.console_url.clone().unwrap_or_default())
+    }
+
     /// The managers as Raft's membership and their own word have them, by
     /// name, and the leader's name (empty when there is none).
     pub(crate) fn managers_seen(&self) -> Result<(Vec<legion_api::ha::Manager>, String), Status> {
@@ -2862,22 +2874,32 @@ impl Cluster for ApiService {
             if !matches!(role.as_str(), "admin" | "user") {
                 return Err(Status::invalid_argument("the role is `admin` or `user`"));
             }
-            if let Some(addr) = self.leader_addr(&req)? {
+            let mut r = if let Some(addr) = self.leader_addr(&req)? {
                 let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                     &addr,
                     self.peer_tls.as_ref(),
                 ));
-                return c
-                    .console_code(forwarded(pb::ConsoleCodeRequest {
-                        for_name: name,
-                        for_role: role,
-                        for_until_ms: until_ms,
-                    }))
-                    .await;
-            }
-            self.consistent().await?;
-            let (code, expires_ms) = crate::console::new_code(self, &name, &role, until_ms).await?;
-            Ok(Response::new(pb::ConsoleCodeResponse { code, expires_ms }))
+                c.console_code(forwarded(pb::ConsoleCodeRequest {
+                    for_name: name,
+                    for_role: role,
+                    for_until_ms: until_ms,
+                }))
+                .await?
+                .into_inner()
+            } else {
+                self.consistent().await?;
+                let (code, expires_ms) =
+                    crate::console::new_code(self, &name, &role, until_ms).await?;
+                pb::ConsoleCodeResponse {
+                    code,
+                    expires_ms,
+                    url: String::new(),
+                }
+            };
+            // Said last by the manager reached, so the link names its own
+            // console, not the leader's: any console takes any code.
+            r.url = self.console_link()?;
+            Ok(Response::new(r))
         }
         .await;
         self.audit_end(audit, result)

@@ -385,12 +385,14 @@ async fn the_console_calls_the_api_as_its_user() {
 
     // Alice's code, as `legion console login` asks for it, signs her in once.
     let alice = channel(&addr, &creds(&ca, "alice", Role::User)).await;
-    let code = ClusterClient::new(alice)
+    let reply = ClusterClient::new(alice)
         .console_code(ConsoleCodeRequest::default())
         .await
         .unwrap()
-        .into_inner()
-        .code;
+        .into_inner();
+    // With it, where her browser reaches this console: the link's base.
+    assert_eq!(reply.url, format!("https://{console}"));
+    let code = reply.code;
     let login = |code: &str, h2: bool, origin: Option<String>| {
         let (ca, console) = (&ca, &console);
         let body = serde_json::json!({ "code": code });
@@ -1519,6 +1521,43 @@ async fn the_console_converts_compose_files_and_lists_templates() {
         }
     }
 
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}
+
+/// `legion console login`'s link: this manager's console as it listens,
+/// until single sign-on names the cluster's console address, which wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_code_says_where_the_console_is() {
+    use legion_proto::v1::SetConsoleOidcRequest;
+    let f = start().await;
+    let mut cluster = ClusterClient::new(f.admin.clone());
+    let url = |r: legion_proto::v1::ConsoleCodeResponse| r.url;
+    let first = cluster
+        .console_code(ConsoleCodeRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(url(first), format!("https://{}", f.console_addr));
+    cluster
+        .set_console_oidc(SetConsoleOidcRequest {
+            oidc_json: serde_json::json!({
+                "issuer": "https://idp.example", "clientId": "legion",
+                "consoleUrl": "https://console.example.org:7480/",
+            })
+            .to_string()
+            .into_bytes(),
+            client_secret: "s3cret".into(),
+            remove: false,
+        })
+        .await
+        .unwrap();
+    let named = cluster
+        .console_code(ConsoleCodeRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(url(named), "https://console.example.org:7480");
     let _ = f.stop.send(());
     f.task.await.unwrap();
 }
