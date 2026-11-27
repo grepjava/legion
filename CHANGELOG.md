@@ -288,6 +288,16 @@ members are told their role only on nodes that read it.
 
 ### Fixed
 
+- **The controller plans from one reading of the cluster.** It read
+  Services, Tasks, Nodes, Volumes and the rest one after another, so a
+  change between two reads could tear them: a Service read just before its
+  deletion and its Tasks just after made it start a Task for a Service that
+  was gone. They are now read in one transaction, at one version.
+- **A container whose start cannot be recorded leaves nothing running.**
+  When its supervisor started the process but could not write `run.json`
+  (a full disk, say), it gave up and left the process running in its jail,
+  with nothing to stop it. Now it kills the process and removes the jail
+  first.
 - **A manager far off can join a cluster that has run a while.** A new
   manager (or one back after long away) is sent a snapshot of the store,
   each chunk within openraft's default 200 ms: under the round trip to a
