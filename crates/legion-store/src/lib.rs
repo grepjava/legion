@@ -222,6 +222,16 @@ impl Store {
         self.state.list(kind, namespace)
     }
 
+    /// Each of `kinds`, read at one version; see
+    /// [`StateMachine::list_kinds`].
+    pub fn list_kinds(
+        &self,
+        kinds: &[Kind],
+        namespace: Option<&str>,
+    ) -> Result<(u64, Vec<Vec<Object>>), Error> {
+        self.state.list_kinds(kinds, namespace)
+    }
+
     /// Every object, read at one version, and the managers. The caller
     /// makes it linearizable as for a list.
     pub fn backup(&self) -> Result<Backup, Error> {

@@ -399,6 +399,55 @@ async fn list_then_watch() {
     assert!(store.watch(applied, None).is_ok());
 }
 
+/// Several kinds listed together are read at one version: a Task put
+/// after its Service is never seen without it, as two lists, read one after
+/// the other, can show it while puts go on (the controller planned from
+/// such a torn read; found by an audit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinds_listed_together_are_read_at_one_version() {
+    let mut c = Cluster::new(config());
+    let store = c.start(1).await;
+    c.initialize(&[1]).await;
+    c.leader(None).await;
+
+    let writer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            for i in 0..150 {
+                let name = format!("p{i}");
+                let svc = Object::new(Kind::Service, "default", &name, serde_json::Value::Null);
+                put(&store, svc, Precondition::None).await;
+                let task = Object::new(Kind::Task, "default", &name, serde_json::Value::Null);
+                put(&store, task, Precondition::None).await;
+            }
+        })
+    };
+    let mut reads = 0;
+    while !writer.is_finished() {
+        let (version, lists) = store
+            .list_kinds(&[Kind::Service, Kind::Task], Some("default"))
+            .unwrap();
+        let services: std::collections::HashSet<_> =
+            lists[0].iter().map(|o| o.metadata.name.clone()).collect();
+        for t in &lists[1] {
+            assert!(
+                services.contains(&t.metadata.name),
+                "task {} without its service at version {version}",
+                t.metadata.name
+            );
+        }
+        reads += 1;
+        tokio::task::yield_now().await;
+    }
+    writer.await.unwrap();
+    let (version, lists) = store
+        .list_kinds(&[Kind::Service, Kind::Task], None)
+        .unwrap();
+    assert_eq!((lists[0].len(), lists[1].len()), (150, 150));
+    assert_eq!(version, store.list(Kind::Task, None).unwrap().version);
+    assert!(reads > 1, "read while the puts went on");
+}
+
 /// Rough write throughput with every log append and apply fsynced.
 /// Run with `cargo test --release -- --ignored --nocapture write_throughput`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

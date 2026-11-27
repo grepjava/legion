@@ -150,18 +150,40 @@ type State = (
 );
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
+    // Every kind the plan weighs, read at one version: read one by one, a
+    // Service read before its deletion and its Tasks after it made the
+    // plan start a Task for a Service that was gone (found by an audit).
+    let (_, lists) = store.list_kinds(
+        &[
+            Kind::ImagePolicy,
+            Kind::Service,
+            Kind::Job,
+            Kind::CronJob,
+            Kind::Task,
+            Kind::Node,
+            Kind::Volume,
+            Kind::Namespace,
+        ],
+        None,
+    )?;
+    let [
+        policies,
+        services,
+        jobs,
+        cron_jobs,
+        tasks,
+        nodes,
+        volumes,
+        namespace_objects,
+    ]: [Vec<Object>; 8] = lists.try_into().expect("a list for each kind");
     // The patterns of every ImagePolicy: a pod they cover waits for the
     // resolver's check of its signatures.
-    let patterns: Vec<String> = store
-        .list(Kind::ImagePolicy, None)?
-        .objects
+    let patterns: Vec<String> = policies
         .iter()
         .filter_map(|o| legion_api::parse::<legion_api::image::ImagePolicySpec>(&o.spec).ok())
         .flat_map(|p| p.images)
         .collect();
-    let services = store
-        .list(Kind::Service, None)?
-        .objects
+    let services = services
         .into_iter()
         .filter_map(|o| {
             let spec: legion_api::service::ServiceSpec = parsed(&o)?;
@@ -175,9 +197,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
         })
         .collect();
     let jobs = Jobs {
-        jobs: store
-            .list(Kind::Job, None)?
-            .objects
+        jobs: jobs
             .into_iter()
             .filter_map(|o| {
                 let spec: legion_api::job::JobSpec = parsed(&o)?;
@@ -191,9 +211,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
                 })
             })
             .collect(),
-        cron_jobs: store
-            .list(Kind::CronJob, None)?
-            .objects
+        cron_jobs: cron_jobs
             .into_iter()
             .filter_map(|o| {
                 let spec = parsed(&o)?;
@@ -207,9 +225,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             .collect(),
         wall: legion_api::clock::now(),
     };
-    let tasks = store
-        .list(Kind::Task, None)?
-        .objects
+    let tasks = tasks
         .into_iter()
         .filter_map(|o| {
             let spec = parsed(&o)?;
@@ -221,9 +237,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             })
         })
         .collect();
-    let nodes = store
-        .list(Kind::Node, None)?
-        .objects
+    let nodes = nodes
         .into_iter()
         .filter_map(|o| {
             let spec = parsed(&o)?;
@@ -235,9 +249,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             })
         })
         .collect();
-    let volumes = store
-        .list(Kind::Volume, None)?
-        .objects
+    let volumes = volumes
         .into_iter()
         .filter_map(|o| {
             let spec = parsed(&o)?;
@@ -254,7 +266,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
         })
         .collect();
     let mut namespaces = Namespaces::default();
-    for o in store.list(Kind::Namespace, None)?.objects {
+    for o in namespace_objects {
         let Some(spec) = parsed::<legion_api::admit::NamespaceSpec>(&o) else {
             continue;
         };

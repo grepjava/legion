@@ -97,22 +97,42 @@ impl StateMachine {
     /// All objects of `kind`, optionally in one namespace, and the version
     /// they were read at. Watch from that version to follow changes.
     pub fn list(&self, kind: Kind, namespace: Option<&str>) -> Result<Listing, Error> {
+        let (version, mut lists) = self.list_kinds(&[kind], namespace)?;
+        Ok(Listing {
+            version,
+            objects: lists.pop().unwrap_or_default(),
+        })
+    }
+
+    /// All objects of each of `kinds`, in their order, optionally in one
+    /// namespace, read in one transaction: at one version, so a change
+    /// between two kinds' reads cannot tear what they say together (a
+    /// Service read before its deletion and its Tasks after it).
+    pub fn list_kinds(
+        &self,
+        kinds: &[Kind],
+        namespace: Option<&str>,
+    ) -> Result<(u64, Vec<Vec<Object>>), Error> {
         let txn = self.db.begin_read().map_err(Error::db)?;
         let meta = txn.open_table(SM_META).map_err(Error::db)?;
         let version = read_json::<Option<LogId<NodeId>>>(&self.codec, &meta, LAST_APPLIED)?
             .flatten()
             .map_or(0, |id| id.index);
         let table = txn.open_table(OBJECTS).map_err(Error::db)?;
-        let prefix = ObjectKey::prefix(kind, namespace);
-        let mut objects = Vec::new();
-        for item in table.range(prefix.as_str()..).map_err(Error::db)? {
-            let (k, v) = item.map_err(Error::db)?;
-            if !k.value().starts_with(&prefix) {
-                break;
+        let mut lists = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            let prefix = ObjectKey::prefix(*kind, namespace);
+            let mut objects = Vec::new();
+            for item in table.range(prefix.as_str()..).map_err(Error::db)? {
+                let (k, v) = item.map_err(Error::db)?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                objects.push(self.codec.decode(OBJECTS_NAME, k.value(), v.value())?);
             }
-            objects.push(self.codec.decode(OBJECTS_NAME, k.value(), v.value())?);
+            lists.push(objects);
         }
-        Ok(Listing { version, objects })
+        Ok((version, lists))
     }
 
     pub fn applied_version(&self) -> Result<u64, Error> {
