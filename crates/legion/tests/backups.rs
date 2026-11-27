@@ -123,10 +123,18 @@ fn check_schedules_go_on(lab: &Lab, node: &str, what: &str) {
         .next()
         .unwrap_or("")
         .to_owned();
-    let since_run = last_ok(&v).and_then(|r| r["at_ms"].as_i64()).unwrap_or(0);
+    let since_run = last_ok(&v).and_then(|r| r["atMs"].as_i64()).unwrap_or(0);
+    let mut polls = 0;
     lab.wait_or_report(&format!("{what}: snapshots and backups go on"), 420, || {
         let held = auto_held(lab, node);
         let v = volume(lab);
+        polls += 1;
+        if polls % 30 == 0 {
+            eprintln!(
+                "{what}: since {since} / {since_run}, {node} holds {held:?}; snapshots {}; backup {}",
+                v["status"]["snapshots"], v["status"]["backup"]
+            );
+        }
         let runs = v["status"]["backup"]["runs"]
             .as_array()
             .cloned()
@@ -134,7 +142,7 @@ fn check_schedules_go_on(lab: &Lab, node: &str, what: &str) {
         let good = runs
             .iter()
             .filter(|r| {
-                r["at_ms"].as_i64().unwrap_or(0) > since_run
+                r["atMs"].as_i64().unwrap_or(0) > since_run
                     && r["error"].as_str().unwrap_or("").is_empty()
             })
             .count();
@@ -496,7 +504,7 @@ spec:
         let v = volume(&lab);
         v["status"]["backup"]["target"] == "offsite" && last_ok(&v).is_some()
     });
-    check_schedules_go_on(&lab, "n2", "a leader's failover");
+    check_schedules_go_on(&lab, "n2", "back to n3 over SSH");
 
     // A real failover: n2 promoted, so three managers vote; n3 made the
     // leader and its daemon stopped. The two left elect one of them, which
@@ -567,7 +575,7 @@ true
         .unwrap_or_default()
         .into_iter()
         .filter(|r| {
-            r["at_ms"].as_i64() > before["at_ms"].as_i64()
+            r["atMs"].as_i64() > before["atMs"].as_i64()
                 && r["error"].as_str().unwrap_or("").is_empty()
         })
         .collect();
