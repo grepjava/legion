@@ -52,6 +52,7 @@ mod restore;
 pub mod roles;
 mod security;
 mod session;
+mod silent;
 mod snapshots;
 mod tls;
 mod upgrade;
@@ -497,6 +498,12 @@ impl Manager {
             let api = api.clone();
             supervised("keeping", stop.clone(), move || history::run(api.clone()))
         };
+        let silence = {
+            let (api, heard) = (api.clone(), self.heard.clone());
+            supervised("silence", stop.clone(), move || {
+                silent::run(api.clone(), heard.clone(), api.closing.clone())
+            })
+        };
         let mirroring = {
             let api = api.clone();
             supervised("mirroring", stop.clone(), move || mirror::run(api.clone()))
@@ -673,6 +680,7 @@ impl Manager {
         ended("floor", floor).await;
         ended("names", names).await;
         ended("keeping", keeping).await;
+        ended("silence", silence).await;
         ended("mirroring", mirroring).await;
         ended("alerting", alerting).await;
         ended("notifying", notifying).await;

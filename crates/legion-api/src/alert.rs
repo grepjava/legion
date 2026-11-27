@@ -69,6 +69,7 @@ pub enum AlertKind {
     DatabaseSplit,
     DatabaseStalled,
     ArchiveLate,
+    ManagerSilent,
 }
 
 impl AlertKind {
@@ -94,6 +95,7 @@ impl AlertKind {
             AlertKind::DatabaseSplit => "database-split",
             AlertKind::DatabaseStalled => "database-stalled",
             AlertKind::ArchiveLate => "archive-late",
+            AlertKind::ManagerSilent => "manager-silent",
         }
     }
 }
@@ -215,6 +217,19 @@ pub struct PoolInput<'a> {
     pub scheduled: bool,
 }
 
+/// A manager the leader has not heard from for [`MANAGER_SILENCE`] or more.
+pub struct SilentManager {
+    pub name: String,
+    /// Since when, in milliseconds since the epoch.
+    pub since_ms: i64,
+    /// It votes: the quorum counts it.
+    pub voter: bool,
+}
+
+/// How long a manager goes unheard by the leader before it is said to be
+/// silent: well past a restart or a heartbeat lost.
+pub const MANAGER_SILENCE: Duration = Duration::from_secs(30);
+
 /// What a manager knows that alerts are worked out from.
 #[derive(Default)]
 pub struct Inputs<'a> {
@@ -233,8 +248,64 @@ pub struct Inputs<'a> {
     pub versions: Vec<(&'a str, &'a str)>,
     /// The replicated databases.
     pub databases: Vec<DatabaseInput<'a>>,
+    /// The managers the leader has not heard from lately, as it recorded
+    /// them; and how many managers vote.
+    pub silent_managers: Vec<SilentManager>,
+    pub voters: usize,
     /// Now, in milliseconds since the epoch.
     pub now_ms: i64,
+}
+
+/// Each manager the leader has not heard from, and what the cluster can
+/// still lose: one that votes and no longer answers leaves no other manager
+/// to spare in a cluster of three, which used to raise nothing as long as
+/// the other two answered (found 2026-11-27, a witness's VPS destroyed).
+fn silent_managers(i: &Inputs) -> Vec<Alert> {
+    let quorum = i.voters / 2 + 1;
+    let silent_voters = i.silent_managers.iter().filter(|m| m.voter).count();
+    let answering = i.voters.saturating_sub(silent_voters);
+    i.silent_managers
+        .iter()
+        .map(|m| {
+            let mins = (i.now_ms - m.since_ms).max(0) / 60_000;
+            let ago = if mins < 1 {
+                "under a minute".to_owned()
+            } else if mins < 120 {
+                format!("{mins} min")
+            } else {
+                format!("{} h", mins / 60)
+            };
+            let (severity, then) = if !m.voter {
+                (Severity::Warning, "it does not vote, so the quorum does not count it".to_owned())
+            } else if answering < quorum {
+                (Severity::Critical, "a majority of managers no longer answers".to_owned())
+            } else if answering == quorum {
+                (
+                    Severity::Critical,
+                    "the cluster survives losing no other manager".to_owned(),
+                )
+            } else {
+                let spare = answering - quorum;
+                (
+                    Severity::Warning,
+                    format!(
+                        "the cluster survives losing {spare} more manager{}",
+                        if spare == 1 { "" } else { "s" }
+                    ),
+                )
+            };
+            Alert {
+                kind: AlertKind::ManagerSilent,
+                severity,
+                namespace: String::new(),
+                object: format!("Manager/{}", m.name),
+                message: format!(
+                    "manager {} has not answered the leader for {ago}: {then}; if it is gone                      for good, join another and remove it (legion delete node {})",
+                    m.name, m.name
+                ),
+            }
+        })
+        .collect()
 }
 
 /// The alerts `i` raises, most severe first, then by kind and object.
@@ -266,6 +337,7 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
             ),
         ));
     }
+    out.extend(silent_managers(i));
     for (name, state) in &i.nodes {
         let (kind, severity, message) = match state {
             NodeState::Down => (
@@ -736,7 +808,7 @@ impl ReceiverSpec {
 }
 
 /// The kinds of alert there are, as receivers name them.
-pub const KINDS: [AlertKind; 20] = [
+pub const KINDS: [AlertKind; 21] = [
     AlertKind::NoLeader,
     AlertKind::NoQuorum,
     AlertKind::NodeDown,
@@ -757,6 +829,7 @@ pub const KINDS: [AlertKind; 20] = [
     AlertKind::DatabaseSplit,
     AlertKind::DatabaseStalled,
     AlertKind::ArchiveLate,
+    AlertKind::ManagerSilent,
 ];
 
 fn http_url(url: &str) -> bool {
@@ -877,6 +950,60 @@ pub struct ReceiverStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manager the leader no longer hears: critical while the cluster
+    /// has no other to spare, a warning while it has; a learner's silence
+    /// touches no quorum.
+    #[test]
+    fn a_silent_manager_says_what_the_cluster_can_still_lose() {
+        let silent = |name: &str, voter| SilentManager {
+            name: name.into(),
+            since_ms: 0,
+            voter,
+        };
+        let raised = |voters, silent_managers| {
+            alerts(&Inputs {
+                leader: true,
+                voters,
+                silent_managers,
+                now_ms: 5 * 60_000,
+                ..Inputs::default()
+            })
+        };
+        // Three voters, one silent: none to spare.
+        let a = raised(3, vec![silent("vultr", true)]);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(
+            (a[0].kind, a[0].severity),
+            (AlertKind::ManagerSilent, Severity::Critical)
+        );
+        assert_eq!(a[0].object, "Manager/vultr");
+        assert!(a[0].message.contains("for 5 min"), "{}", a[0].message);
+        assert!(
+            a[0].message.contains("losing no other manager"),
+            "{}",
+            a[0].message
+        );
+        assert!(
+            a[0].message.contains("legion delete node vultr"),
+            "{}",
+            a[0].message
+        );
+        // Five voters, one silent: one more may go.
+        let a = raised(5, vec![silent("m5", true)]);
+        assert_eq!(a[0].severity, Severity::Warning);
+        assert!(
+            a[0].message.contains("losing 1 more manager;"),
+            "{}",
+            a[0].message
+        );
+        // A learner.
+        let a = raised(3, vec![silent("new", false)]);
+        assert_eq!(a[0].severity, Severity::Warning);
+        assert!(a[0].message.contains("does not vote"), "{}", a[0].message);
+        // None silent: nothing.
+        assert!(raised(3, Vec::new()).is_empty());
+    }
 
     #[test]
     fn a_healthy_cluster_raises_nothing() {

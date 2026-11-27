@@ -150,3 +150,16 @@ describe('YAML as legion get writes it', () => {
     expect(toYaml(null)).toBe('null\n');
   });
 });
+
+describe('an alert link', () => {
+  it('goes to its object, the cluster, or for a manager the Availability page', async () => {
+    const { alertHref } = await import('./api.ts');
+    const a = (object: string, namespace = '') =>
+      ({ kind: 'k', severity: 'warning', namespace, object, message: '', since_ms: 0 }) as Parameters<
+        typeof alertHref
+      >[0];
+    expect(alertHref(a('Volume/data', 'shop'))).toBe('/k/Volume/shop/data');
+    expect(alertHref(a(''))).toBe('/cluster');
+    expect(alertHref(a('Manager/vultr'))).toBe('/availability');
+  });
+});

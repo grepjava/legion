@@ -294,6 +294,15 @@ members are told their role only on nodes that read it.
   witness across the internet, so it never arrived, and the leader sent the
   first chunk again every 200 ms without end. Each chunk (now 256 KiB) has
   30 s.
+- **A manager that stops answering raises an alert** (`manager-silent`):
+  the leader records each manager it has not heard from for 30 s, so every
+  manager says the same; critical when the cluster can then lose no other.
+  A voter gone silent used to raise nothing while the others still made a
+  majority, so a cluster left with nothing to spare said so nowhere.
+- **Agents no longer turn to a witness.** They were told of every manager,
+  witnesses too, and one whose manager failed could turn to a witness,
+  which serves no clients: a task's start failed on a timeout to a
+  destroyed witness's address.
 - **A witness gone for good can be removed** (`legion delete node NAME`,
   checked first as a node's removal is), as can a manager started without
   an agent: neither has a Node, so the removal answered "not found" and the

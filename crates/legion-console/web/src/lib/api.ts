@@ -1172,6 +1172,9 @@ export function followConnections(
 export function alertHref(a: Alert): string {
   if (!a.object) return '/cluster';
   const [kind, name] = a.object.split('/', 2);
+  // A manager is not an object (a witness has no Node): the managers are
+  // on the Availability page.
+  if (kind === 'Manager') return '/availability';
   return `/k/${encodeURIComponent(kind)}/${encodeURIComponent(a.namespace || '_')}/${encodeURIComponent(name)}`;
 }
 

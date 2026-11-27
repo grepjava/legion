@@ -283,6 +283,25 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
         );
     }
     let m = store.raft.metrics().borrow().clone();
+    // The managers the leader recorded as not answering, that are still
+    // members; named as they said, else by id.
+    let membership = m.membership_config.membership();
+    inputs.voters = membership.voter_ids().count();
+    let silent = crate::silent::read(store).unwrap_or_default();
+    if !silent.is_empty() {
+        let names = crate::managers::names(store).unwrap_or_default();
+        let voters: std::collections::BTreeSet<_> = membership.voter_ids().collect();
+        for (id, since_ms) in silent {
+            if !membership.nodes().any(|(n, _)| *n == id) {
+                continue;
+            }
+            inputs.silent_managers.push(alert::SilentManager {
+                name: names.get(&id).cloned().unwrap_or_else(|| format!("#{id}")),
+                since_ms,
+                voter: voters.contains(&id),
+            });
+        }
+    }
     inputs.leader = m.current_leader.is_some();
     if m.current_leader == Some(api.id) {
         inputs.quorum_silence = m.millis_since_quorum_ack.map(Duration::from_millis);

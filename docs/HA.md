@@ -50,6 +50,14 @@ legion join --witness --manager m1.example.org:7470 LGN-1-...
 service legion start
 ```
 
+A manager the leader has not heard from for 30 s raises the
+`manager-silent` alert on every manager (the leader records it in the
+store, so whichever the console or the CLI asks says the same): critical
+when the cluster can then lose no other manager, as with one of three gone,
+a warning while it can. It used to raise nothing as long as the others
+still made a majority. Agents are told of the full managers only, never a
+witness, which serves them nothing.
+
 A witness whose machine is gone for good is removed by its name, as any
 manager is: `legion delete node NAME` (checked first, as a node's removal
 is). It has no Node (it runs no agent), which used to leave it

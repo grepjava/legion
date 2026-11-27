@@ -7237,6 +7237,24 @@ async fn leadership_is_handed_on_with_nothing_down() {
         node_state(&first, "w1").as_deref() == Some("ready")
     })
     .await;
+    // An agent is told of the full managers to turn to, never the witness,
+    // which serves no clients (an agent turned to a destroyed witness's
+    // address and failed a task's start, 2026-11-27).
+    let told = d1
+        .clone()
+        .heartbeat(HeartbeatRequest {
+            node: String::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .managers;
+    assert!(
+        told.contains(&first.addr) && told.contains(&second.addr),
+        "{told:?}"
+    );
+    assert!(!told.contains(&witness.addr), "{told:?}");
 
     // Refused: to a witness, to the leader itself, by a user.
     let err = c
@@ -7717,6 +7735,23 @@ async fn a_users_event_stream_ends_when_their_binding_goes() {
     assert_eq!(e.code(), Code::PermissionDenied, "{e}");
 }
 
+/// The `manager-silent` alert `m` raises now, if any: its severity and
+/// object.
+async fn silent_alert(m: &Running) -> Option<(String, String)> {
+    let mut w = ClusterClient::new(m.channel(m.tls.as_ref()).await.unwrap())
+        .watch_alerts(legion_proto::v1::AlertsRequest {
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let r = w.message().await.unwrap().unwrap();
+    r.alerts
+        .into_iter()
+        .find(|a| a.kind == "manager-silent")
+        .map(|a| (a.severity, a.object))
+}
+
 /// A witness whose machine is gone for good is removed by name, as a
 /// manager's Node deleted removes it: it has no Node (it runs no agent), so
 /// it could not be removed at all, and kept counting toward the quorum
@@ -7755,8 +7790,25 @@ async fn a_witness_gone_for_good_is_removed_by_name() {
         assert!(tokio::time::Instant::now() < deadline, "{r:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    // Gone for good.
+    // Gone for good: the leader no longer hears it, and every manager says
+    // so, the second as the first, as the cluster has no other to spare.
     witness.stop().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    for m in [&first, &second] {
+        loop {
+            match silent_alert(m).await {
+                Some(found) => {
+                    assert_eq!(found, ("critical".to_owned(), "Manager/w".to_owned()));
+                    break;
+                }
+                None => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no manager-silent alert"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 
     let checked = c
         .dry_run(legion_proto::v1::DryRunRequest {
@@ -7806,6 +7858,12 @@ async fn a_witness_gone_for_good_is_removed_by_name() {
             .count(),
         2
     );
+    // Out of the membership, it is silent no more.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while silent_alert(&first).await.is_some() {
+        assert!(tokio::time::Instant::now() < deadline, "the alert stayed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     // The two left still write.
     eventually(|| {
         let mut o = o.clone();
