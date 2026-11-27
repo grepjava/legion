@@ -716,6 +716,51 @@ async fn standalone_containers_and_build_steps() {
         ..Default::default()
     };
 
+    // A supervisor that cannot record the run it started (its run.json a
+    // directory here) leaves nothing behind: its process killed, its jail
+    // gone, the failure in exit.json (an audit found both left running).
+    let unrecorded = rt
+        .create(&standalone("unrecorded", "exec sleep 300"))
+        .await
+        .unwrap();
+    let cdir = dir.join("jails").join(&unrecorded);
+    std::fs::create_dir_all(cdir.join("run.json/blocked")).unwrap();
+    let jail = format!("lunrec{}", std::process::id());
+    let made = std::process::Command::new("jail")
+        .args(["-i", "-c", &format!("name={jail}"), "path=/", "persist"])
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let jid = String::from_utf8_lossy(&made.stdout).trim().to_owned();
+    let shim = std::process::Command::new(env!("CARGO_BIN_EXE_legion-jail-shim"))
+        .args(["supervise", cdir.to_str().unwrap(), &jid])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&shim.stdout);
+    assert!(said.starts_with("err writing run.json"), "{said}");
+    let left = std::process::Command::new("jls")
+        .args(["-j", &jid])
+        .output()
+        .unwrap();
+    if left.status.success() {
+        let _ = std::process::Command::new("jail")
+            .args(["-r", &jid])
+            .status();
+        panic!(
+            "the jail of a start that failed is left: {}",
+            String::from_utf8_lossy(&left.stdout)
+        );
+    }
+    let exit = std::fs::read_to_string(cdir.join("exit.json")).unwrap();
+    assert!(exit.contains("writing run.json"), "{exit}");
+    std::fs::remove_dir_all(cdir.join("run.json")).unwrap();
+    rt.remove(&unrecorded).await.unwrap();
+
     // Supervised: a jail of its own on the host's addresses, locked down
     // as a pod's member is.
     let app = rt

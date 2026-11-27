@@ -386,7 +386,19 @@ mod imp {
             boot: state::boot_time(),
             boot_id: state::boot_id(),
         };
-        state::write(dir, RUN, &run).map_err(|e| format!("writing run.json: {e}"))?;
+        if let Err(e) = state::write(dir, RUN, &run) {
+            // Unrecorded, the process would run on with nothing to stop
+            // it, its jail kept: both go before the start is refused.
+            // SAFETY: the child is ours and not yet reaped; the jail is
+            // the one it was started in.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0);
+                libc::jail_remove(jid);
+            }
+            return Err(format!("writing run.json: {e}"));
+        }
         answer(&format!("ok {pid}"));
         // Nothing more for the runtime, which may go away.
         if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
